@@ -607,9 +607,14 @@ std::vector<Domain> applyPeakMergeHistory(
         if (domain.peaks.size() == 2) {
             const Peak &first = domain.peaks[0];
             const Peak &second = domain.peaks[1];
-            if (first.value == second.value &&
-                std::max(std::abs(first.index / kColumns - second.index / kColumns),
-                         std::abs(first.index % kColumns - second.index % kColumns)) == 1) {
+            const int row_distance = std::abs(
+                first.index / kColumns - second.index / kColumns);
+            const int column_distance = std::abs(
+                first.index % kColumns - second.index % kColumns);
+            const bool close_island_pair =
+                std::max(row_distance, column_distance) <= 2 &&
+                std::min(row_distance, column_distance) <= 1;
+            if (close_island_pair) {
                 selected.push_back(Domain{0, domain.nodes, ordered_peaks});
                 continue;
             }
