@@ -965,43 +965,105 @@ std::vector<std::pair<int, int>> minimumDistanceAssignment(
     const bool transpose = predictions.size() > contacts.size();
     const auto &rows = transpose ? contacts : predictions;
     const auto &columns = transpose ? predictions : contacts;
-    std::vector<std::vector<int>> costs(rows.size(),
-                                        std::vector<int>(columns.size()));
+    if (columns.size() > kFingerSlots) {
+        std::vector<std::vector<int>> costs(rows.size(),
+                                            std::vector<int>(columns.size()));
+        for (size_t row = 0; row < rows.size(); ++row)
+            for (size_t column = 0; column < columns.size(); ++column)
+                costs[row][column] = contactDistance(
+                    rows[row].first, rows[row].second,
+                    columns[column].first, columns[column].second);
+        std::map<std::pair<int, uint32_t>, AssignmentResult> memo;
+        std::function<AssignmentResult(int, uint32_t)> solve =
+            [&](int row, uint32_t used) -> AssignmentResult {
+                if (row == static_cast<int>(rows.size()))
+                    return AssignmentResult{0, {}};
+                const auto key = std::make_pair(row, used);
+                if (memo.contains(key))
+                    return memo[key];
+                AssignmentResult best;
+                for (int column = 0;
+                     column < static_cast<int>(columns.size()); ++column) {
+                    if (used & (1U << column))
+                        continue;
+                    AssignmentResult tail =
+                        solve(row + 1, used | (1U << column));
+                    AssignmentResult candidate;
+                    candidate.cost = costs[row][column] + tail.cost;
+                    candidate.selected.push_back(column);
+                    candidate.selected.insert(candidate.selected.end(),
+                                              tail.selected.begin(),
+                                              tail.selected.end());
+                    if (candidate.cost < best.cost ||
+                        (candidate.cost == best.cost &&
+                         candidate.selected < best.selected))
+                        best = std::move(candidate);
+                }
+                memo[key] = best;
+                return best;
+            };
+        const AssignmentResult result = solve(0, 0);
+        std::vector<std::pair<int, int>> pairs;
+        pairs.reserve(result.selected.size());
+        for (size_t row = 0; row < result.selected.size(); ++row)
+            pairs.emplace_back(
+                transpose ? result.selected[row] : static_cast<int>(row),
+                transpose ? static_cast<int>(row) : result.selected[row]);
+        std::sort(pairs.begin(), pairs.end());
+        return pairs;
+    }
+
+    constexpr size_t kMaskCount = 1U << kFingerSlots;
+    struct Workspace {
+        std::array<int, kMaskCount> costs{};
+        std::array<int8_t, kMaskCount> choices{};
+    };
+    static thread_local Workspace workspace;
+
+    const size_t row_count = rows.size();
+    const size_t column_count = columns.size();
+    const size_t state_count = 1U << column_count;
+    std::array<std::array<int, kFingerSlots>, kFingerSlots> distances{};
     for (size_t row = 0; row < rows.size(); ++row)
         for (size_t column = 0; column < columns.size(); ++column)
-            costs[row][column] = contactDistance(
+            distances[row][column] = contactDistance(
                 rows[row].first, rows[row].second,
                 columns[column].first, columns[column].second);
-    std::map<std::pair<int, uint32_t>, AssignmentResult> memo;
-    std::function<AssignmentResult(int, uint32_t)> solve =
-        [&](int row, uint32_t used) -> AssignmentResult {
-            if (row == static_cast<int>(rows.size()))
-                return AssignmentResult{0, {}};
-            const auto key = std::make_pair(row, used);
-            if (memo.contains(key))
-                return memo[key];
-            AssignmentResult best;
-            for (int column = 0; column < static_cast<int>(columns.size()); ++column) {
-                if (used & (1U << column))
+
+    for (uint32_t used = 0; used < state_count; ++used)
+        if (std::popcount(used) == static_cast<int>(row_count))
+            workspace.costs[used] = 0;
+    for (size_t row = row_count; row-- > 0;) {
+        for (uint32_t used = 0; used < state_count; ++used) {
+            if (std::popcount(used) != static_cast<int>(row))
+                continue;
+            int best_cost = std::numeric_limits<int>::max();
+            int best_column = -1;
+            for (size_t column = 0; column < column_count; ++column) {
+                const uint32_t bit = 1U << column;
+                if (used & bit)
                     continue;
-                AssignmentResult tail = solve(row + 1, used | (1U << column));
-                AssignmentResult candidate;
-                candidate.cost = costs[row][column] + tail.cost;
-                candidate.selected.push_back(column);
-                candidate.selected.insert(candidate.selected.end(),
-                                          tail.selected.begin(), tail.selected.end());
-                if (candidate.cost < best.cost ||
-                    (candidate.cost == best.cost && candidate.selected < best.selected))
-                    best = std::move(candidate);
+                const int candidate = distances[row][column] +
+                    workspace.costs[used | bit];
+                if (candidate < best_cost) {
+                    best_cost = candidate;
+                    best_column = static_cast<int>(column);
+                }
             }
-            memo[key] = best;
-            return best;
-        };
-    const AssignmentResult result = solve(0, 0);
+            workspace.costs[used] = best_cost;
+            workspace.choices[used] = static_cast<int8_t>(best_column);
+        }
+    }
+
     std::vector<std::pair<int, int>> pairs;
-    for (size_t row = 0; row < result.selected.size(); ++row)
-        pairs.emplace_back(transpose ? result.selected[row] : static_cast<int>(row),
-                           transpose ? static_cast<int>(row) : result.selected[row]);
+    pairs.reserve(row_count);
+    uint32_t used = 0;
+    for (size_t row = 0; row < row_count; ++row) {
+        const int column = workspace.choices[used];
+        pairs.emplace_back(transpose ? column : static_cast<int>(row),
+                           transpose ? static_cast<int>(row) : column);
+        used |= 1U << column;
+    }
     std::sort(pairs.begin(), pairs.end());
     return pairs;
 }

@@ -101,6 +101,21 @@ void setupAxis(int fd, unsigned code, int minimum, int maximum,
         throw std::runtime_error("UI_ABS_SETUP failed");
 }
 
+void writeInputEvents(int fd, const input_event *events, size_t count) {
+    const uint8_t *data = reinterpret_cast<const uint8_t *>(events);
+    size_t remaining = count * sizeof(*events);
+    while (remaining > 0) {
+        const ssize_t written = write(fd, data, remaining);
+        if (written < 0 && errno == EINTR)
+            continue;
+        if (written <= 0 ||
+            written % static_cast<ssize_t>(sizeof(*events)) != 0)
+            throw std::runtime_error("uinput event write failed");
+        data += written;
+        remaining -= static_cast<size_t>(written);
+    }
+}
+
 class UInputTouch {
 public:
     UInputTouch() {
@@ -152,6 +167,15 @@ public:
     }
 
     void report(const std::vector<nvt::Slot> &slots) {
+        std::array<input_event, nvt::kFingerSlots * 7 + 2> events;
+        size_t event_count = 0;
+        auto event = [&](uint16_t type, uint16_t code, int32_t value) {
+            input_event &input = events[event_count++];
+            input = {};
+            input.type = type;
+            input.code = code;
+            input.value = value;
+        };
         std::array<const nvt::Slot *, nvt::kFingerSlots> visible{};
         for (const nvt::Slot &slot : slots)
             visible[slot.number] = &slot;
@@ -181,6 +205,7 @@ public:
         }
         event(EV_KEY, BTN_TOUCH, slots.empty() ? 0 : 1);
         event(EV_SYN, SYN_REPORT, 0);
+        writeInputEvents(fd_, events.data(), event_count);
     }
 
 private:
@@ -192,14 +217,6 @@ private:
             throw std::runtime_error("uinput capability ioctl failed");
     }
 
-    void event(uint16_t type, uint16_t code, int32_t value) {
-        input_event input{};
-        input.type = type;
-        input.code = code;
-        input.value = value;
-        if (write(fd_, &input, sizeof(input)) != sizeof(input))
-            throw std::runtime_error("uinput event write failed");
-    }
 };
 
 struct PenState {
@@ -261,6 +278,15 @@ public:
     }
 
     void report(const PenState &state) {
+        std::array<input_event, 11> events;
+        size_t event_count = 0;
+        auto event = [&](uint16_t type, uint16_t code, int32_t value) {
+            input_event &input = events[event_count++];
+            input = {};
+            input.type = type;
+            input.code = code;
+            input.value = value;
+        };
         const bool contact = state.active && state.contact;
         event(EV_KEY, BTN_TOOL_PEN, state.active);
         event(EV_KEY, BTN_TOUCH, contact);
@@ -278,6 +304,7 @@ public:
         event(EV_ABS, ABS_TILT_X, state.active ? state.tilt_x : 0);
         event(EV_ABS, ABS_TILT_Y, state.active ? state.tilt_y : 0);
         event(EV_SYN, SYN_REPORT, 0);
+        writeInputEvents(fd_, events.data(), event_count);
     }
 
 private:
@@ -288,14 +315,6 @@ private:
             throw std::runtime_error("uinput capability ioctl failed");
     }
 
-    void event(uint16_t type, uint16_t code, int32_t value) {
-        input_event input{};
-        input.type = type;
-        input.code = code;
-        input.value = value;
-        if (write(fd_, &input, sizeof(input)) != sizeof(input))
-            throw std::runtime_error("uinput event write failed");
-    }
 };
 
 std::string readFirstLine(const std::filesystem::path &path) {

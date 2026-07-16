@@ -2,7 +2,7 @@
 set -eu
 
 APP=xiaomi-sheng-thp
-VERSION=0.3.0
+VERSION=0.3.1
 ARCH="$(dpkg --print-architecture)"
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 PKGROOT="$(mktemp -d)"
