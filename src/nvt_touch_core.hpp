@@ -75,6 +75,7 @@ public:
     TouchCore();
 
     void reset();
+    void processNoTouch(int matrix_maximum = 0);
     FrameResult process(const Matrix &matrix,
                         std::optional<uint16_t> counter = std::nullopt,
                         uint8_t frame_type = 4);
@@ -114,6 +115,7 @@ private:
     std::optional<Matrix> reference_;
     std::vector<Plan> previous_plans_;
     std::vector<Domain> previous_groups_;
+    std::vector<Domain> previous_domains_;
     std::vector<NodeSet> previous_domain_peak_sets_;
     std::vector<MergeHistory> previous_histories_;
     std::array<TrackerSlot, kFingerSlots> tracker_{};
@@ -124,7 +126,10 @@ private:
     int base_refresh_count_ = 0;
     std::optional<uint16_t> last_counter_;
 
-    bool updatePalm(const std::vector<Domain> &domains, int matrix_maximum);
+    void decayPalmNoPeaks(int matrix_maximum);
+    bool updatePalm(const Matrix &delta, const std::vector<Peak> &peaks,
+                    const std::vector<Domain> &domains,
+                    int matrix_maximum);
     std::vector<Slot> updateTracker(
         const std::vector<Contact> &contacts,
         std::vector<TrackedSlot> *tracked_slots = nullptr);

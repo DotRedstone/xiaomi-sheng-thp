@@ -5,9 +5,9 @@ for the Xiaomi Pad 6S Pro (`sheng`) with an NT36532E touch controller. It
 reads raw THP frames from the kernel and creates standard Linux input devices
 through uinput.
 
-Finger input, pen coordinates, tilt, hover, and Bluetooth HID pressure are
-supported. Please note that pen scanning is only available when the panel is
-running at 60 Hz or 120 Hz.
+Finger input, multi-touch tracking, palm rejection, pen coordinates, tilt,
+hover, and Bluetooth HID pressure are supported. Please note that pen scanning
+is only available when the panel is running at 60 Hz or 120 Hz.
 
 ## Requirements
 

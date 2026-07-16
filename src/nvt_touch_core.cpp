@@ -1014,6 +1014,7 @@ void TouchCore::reset() {
     reference_.reset();
     previous_plans_.clear();
     previous_groups_.clear();
+    previous_domains_.clear();
     previous_domain_peak_sets_.clear();
     previous_histories_.clear();
     tracker_.fill(TrackerSlot{});
@@ -1025,25 +1026,106 @@ void TouchCore::reset() {
     last_counter_.reset();
 }
 
-bool TouchCore::updatePalm(const std::vector<Domain> &domains,
-                                  int matrix_maximum) {
-    if (domains.empty()) {
-        if (!palm_latched_)
-            palm_retain_count_ = 0;
-        else if (palm_retain_count_ < 1)
-            palm_latched_ = false;
-        else {
-            const int previous = palm_retain_count_--;
-            if (previous >= 7 && matrix_maximum <= 199)
-                palm_retain_count_ >>= 1;
-        }
-        previous_palm_domains_.clear();
+void TouchCore::decayPalmNoPeaks(int matrix_maximum) {
+    if (!palm_latched_)
+        palm_retain_count_ = 0;
+    else if (palm_retain_count_ < 1)
+        palm_latched_ = false;
+    else {
+        const int previous = palm_retain_count_--;
+        if (previous >= 7 && matrix_maximum <= 199)
+            palm_retain_count_ >>= 1;
+    }
+    previous_palm_domains_.clear();
+}
+
+void TouchCore::processNoTouch(int matrix_maximum) {
+    decayPalmNoPeaks(matrix_maximum);
+}
+
+bool TouchCore::updatePalm(const Matrix &delta,
+                           const std::vector<Peak> &peaks,
+                           const std::vector<Domain> &domains,
+                           int matrix_maximum) {
+    if (peaks.empty()) {
+        decayPalmNoPeaks(matrix_maximum);
         return false;
     }
 
-    std::vector<PalmDomain> current;
     bool detected = false;
+    const int half_maximum = matrix_maximum / 2;
+    const int required_nodes = matrix_maximum > 700 ? 52 : 62;
+    for (const Peak &peak : peaks) {
+        if (peak.value < half_maximum || peak.value < 500)
+            continue;
+        const int threshold = std::max(200, peak.value * 6 / 10);
+        const int peak_row = peak.index / kColumns;
+        const int peak_column = peak.index % kColumns;
+        int count = 0;
+        int minimum_column = peak_column;
+        int maximum_column = peak_column;
+        const auto scan_row = [&](int row) {
+            int row_count = 0;
+            for (int column = peak_column; column >= 0; --column) {
+                const int value = delta[row * kColumns + column];
+                if (value <= threshold || value > peak.value)
+                    break;
+                ++row_count;
+                ++count;
+                minimum_column = std::min(minimum_column, column);
+                maximum_column = std::max(maximum_column, column);
+            }
+            for (int column = peak_column + 1; column < kColumns; ++column) {
+                const int value = delta[row * kColumns + column];
+                if (value <= threshold || value > peak.value)
+                    break;
+                ++row_count;
+                ++count;
+                minimum_column = std::min(minimum_column, column);
+                maximum_column = std::max(maximum_column, column);
+            }
+            return row_count;
+        };
+        for (int row = peak_row; row >= 0; --row)
+            if (scan_row(row) == 0)
+                break;
+        for (int row = peak_row + 1; row < kRows; ++row)
+            if (scan_row(row) == 0)
+                break;
+        if (maximum_column - minimum_column > 3 && count >= required_nodes) {
+            detected = true;
+            break;
+        }
+    }
+
+    int positive_area = 0;
+    int negative_area = 0;
+    for (int value : delta) {
+        positive_area += value > 300;
+        negative_area += value < -300;
+    }
+    const int total_area = positive_area + negative_area;
+    if (positive_area > 110)
+        detected |= total_area > 720 || negative_area > 30;
+    else
+        detected |= total_area > 720;
+
+    std::vector<std::pair<int, int>> previous_coordinates;
+    for (const Domain &domain : previous_domains_) {
+        if (domain.peaks.empty())
+            continue;
+        const Peak &peak = *std::max_element(
+            domain.peaks.begin(), domain.peaks.end(),
+            [](const Peak &first, const Peak &second) {
+                return first.value < second.value;
+            });
+        previous_coordinates.emplace_back(
+            peak.index % kColumns, peak.index / kColumns);
+    }
+
+    std::vector<PalmDomain> current;
     const bool was_latched = palm_latched_;
+    constexpr int stylus_adjustment = 5;
     for (const Domain &domain : domains) {
         std::vector<std::pair<int, int>> points;
         int maximum_column = 0;
@@ -1123,6 +1205,21 @@ bool TouchCore::updatePalm(const std::vector<Domain> &domains,
         }
         const int row_span = maximum_domain_row - minimum_row;
         const int column_span = maximum_domain_column - minimum_column;
+        int coordinate_overlap = 0;
+        const int expanded_minimum_row = std::max(minimum_row - 2, 0);
+        const int expanded_maximum_row = std::min(maximum_domain_row + 2,
+                                                   kRows - 1);
+        const int expanded_minimum_column = std::max(minimum_column - 2, 0);
+        const int expanded_maximum_column = std::min(
+            maximum_domain_column + 2, kColumns - 1);
+        for (auto [column, row] : previous_coordinates) {
+            const int index = row * kColumns + column;
+            if (domain.nodes.test(index) ||
+                (expanded_minimum_column <= column &&
+                 column <= expanded_maximum_column &&
+                 expanded_minimum_row <= row && row <= expanded_maximum_row))
+                ++coordinate_overlap;
+        }
         int palm_count = 0;
         if (!was_latched && area_minus_seed > 9 && major_length > 7.0 &&
             minor_width > 3.9 && shape_ratio < 0.75) {
@@ -1140,12 +1237,17 @@ bool TouchCore::updatePalm(const std::vector<Domain> &domains,
         }
         current.push_back(PalmDomain{domain.nodes, major_length, minor_width,
                                      shape_ratio, palm_count});
-        const bool broad_shape = shape_ratio > 0.8 &&
+        const bool broad_shape =
+            ((row_span < 12 && column_span < 12) || matrix_maximum < 1101) &&
+            coordinate_overlap < 2 && shape_ratio > 0.8 &&
             ((row_span > 7 && column_span > 7) ||
              (row_span > 6 && column_span > 6 && row_span + column_span > 14)) &&
-            area_minus_seed >= 59 && matrix_maximum < 1101;
+            ((area_minus_seed >= 63 - stylus_adjustment &&
+              matrix_maximum > 1100) ||
+             (area_minus_seed >= 59 - stylus_adjustment &&
+              matrix_maximum < 1101));
         bool filled_rectangle = false;
-        if (row_span > 8 && column_span > 8) {
+        if (coordinate_overlap < 2 && row_span > 8 && column_span > 8) {
             const int rectangle_area = (row_span + 1) * (column_span + 1);
             const int fill_ratio = rectangle_area
                 ? area_minus_seed * 100 / rectangle_area : 0;
@@ -1154,23 +1256,17 @@ bool TouchCore::updatePalm(const std::vector<Domain> &domains,
                 matrix_maximum <= 1049;
         }
         const bool persistent_shape = !was_latched &&
-            ((area_minus_seed >= 48 && palm_count > 1) ||
+            ((area_minus_seed >= 48 - stylus_adjustment && palm_count > 1) ||
              area_minus_seed > 49 ||
-             (shape_ratio > 0.5 && area_minus_seed >= 53)) &&
+             (shape_ratio > 0.5 &&
+              area_minus_seed >= 53 - stylus_adjustment)) &&
             matrix_maximum < 950;
-        detected |= broad_shape || filled_rectangle || persistent_shape;
+        if (coordinate_overlap < 2)
+            detected |= broad_shape || filled_rectangle || persistent_shape;
     }
     if (detected) {
         palm_latched_ = true;
         palm_retain_count_ = 50;
-    } else if (palm_latched_) {
-        if (palm_retain_count_ < 1)
-            palm_latched_ = false;
-        else {
-            const int previous = palm_retain_count_--;
-            if (previous >= 7 && matrix_maximum <= 199)
-                palm_retain_count_ >>= 1;
-        }
     }
     const bool active = palm_latched_;
     previous_palm_domains_ = active ? std::vector<PalmDomain>{}
@@ -1286,10 +1382,11 @@ FrameResult TouchCore::process(const Matrix &matrix,
     result.search_peaks = localPeaks(result.delta);
     result.peaks = filterEqualAdjacentPeaks(result.delta, result.search_peaks);
     result.domains = connectedDomains(filtered, result.peaks);
-    // Palm classification remains disabled until the original 0x4dee4
-    // state machine is recovered. The existing classifier is diagnostic.
-    result.palm_active = false;
-    const std::vector<Domain> &processing_domains = result.domains;
+    result.palm_active = updatePalm(
+        result.delta, result.peaks, result.domains, matrix_maximum);
+    const std::vector<Domain> empty_domains;
+    const std::vector<Domain> &processing_domains = result.palm_active
+        ? empty_domains : result.domains;
     const Matrix projection_filtered = projectionNoiseFilter(result.delta);
     std::vector<Plan> current_plans;
     for (const Domain &domain : processing_domains)
@@ -1329,6 +1426,7 @@ FrameResult TouchCore::process(const Matrix &matrix,
         previous_plans_.clear();
     }
     previous_groups_ = groups;
+    previous_domains_ = result.domains;
     previous_domain_peak_sets_.clear();
     for (const Domain &domain : processing_domains)
         previous_domain_peak_sets_.push_back(peakSet(domain));

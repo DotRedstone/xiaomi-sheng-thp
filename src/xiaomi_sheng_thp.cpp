@@ -505,6 +505,10 @@ public:
         return {std::move(result), false};
     }
 
+    void feedNoTouch() {
+        core_.processNoTouch();
+    }
+
 private:
     nvt::TouchCore core_;
     nvt::FingerFilter filter_;
@@ -620,6 +624,7 @@ int main() try {
                     const uint8_t data_type =
                         frame[kTransportLength + 0x38];
                     if (data_type == 0x1d) {
+                        adapter.feedNoTouch();
                         const int pressure = pen_pressure.consume();
                         nvt::RawStylusFrame raw_stylus;
                         if (!nvt::parseRawStylusFrame(
