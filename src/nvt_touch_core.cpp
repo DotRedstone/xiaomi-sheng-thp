@@ -26,6 +26,11 @@ constexpr int kCoordinateReduce = 25;
 constexpr int kDownThreshold = 300;
 constexpr int kUpThreshold = 220;
 constexpr int kBaseRefreshDelay = 8;
+constexpr int kAxisMappingBase = 2700;
+constexpr int kAxisMappingEdge = 600;
+constexpr int kAxisMappingGain = 4350;
+constexpr int kShortAxisMaximum = 20320;
+constexpr int kLongAxisMaximum = 30480;
 
 constexpr std::array<int, kRows> kRowMap = {
     26, 78, 130, 182, 234, 286, 338, 390, 442, 494,
@@ -1013,6 +1018,29 @@ std::optional<Contact> domainContact(const Matrix &delta, const Domain &domain) 
                    domain.nodes};
 }
 
+int mapEdgeAxis(int value, int maximum, bool low_edge_bias) {
+    if (value < kAxisMappingEdge) {
+        int mapped = kAxisMappingGain * (kAxisMappingEdge - value) /
+                     kAxisMappingBase;
+        mapped = std::min(mapped, kAxisMappingEdge - 1);
+        return kAxisMappingEdge - mapped - (low_edge_bias ? 1 : 0);
+    }
+    const int edge_start = maximum - kAxisMappingEdge;
+    if (value > edge_start) {
+        int mapped = kAxisMappingGain * (value - edge_start) /
+                     kAxisMappingBase;
+        mapped = std::min(mapped, kAxisMappingEdge - 1);
+        return edge_start + mapped;
+    }
+    return value;
+}
+
+void mapContactEdges(Contact &contact) {
+    // Apply the edge mapping before slot tracking and filtering.
+    contact.y = mapEdgeAxis(contact.y, kShortAxisMaximum, true);
+    contact.x = mapEdgeAxis(contact.x, kLongAxisMaximum, false);
+}
+
 int contactDistance(int first_x, int first_y, int second_x, int second_y) {
     const float dx = static_cast<float>(first_x - second_x);
     const float dy = static_cast<float>(first_y - second_y);
@@ -1545,9 +1573,12 @@ FrameResult TouchCore::process(const Matrix &matrix,
                     [](bool value) { return value; }))
         groups = coordinateFringeGroups(groups, coordinate_delta, fringe_active);
     result.groups = groups;
-    for (const Domain &domain : groups)
-        if (auto contact = domainContact(coordinate_delta, domain))
+    for (const Domain &domain : groups) {
+        if (auto contact = domainContact(coordinate_delta, domain)) {
+            mapContactEdges(*contact);
             result.contacts.push_back(std::move(*contact));
+        }
+    }
     result.slots = updateTracker(result.contacts, &result.tracked_slots);
 
     if (result.palm_active) {

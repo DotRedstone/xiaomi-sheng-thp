@@ -76,7 +76,7 @@ struct InterferenceLine {
     float slope = 0.0F;
 };
 
-int truncateFactoryFloat(float value) {
+int truncateInterferenceFloat(float value) {
     if (std::isnan(value))
         return 0;
     if (value >= static_cast<float>(std::numeric_limits<int>::max()))
@@ -154,7 +154,7 @@ void subtractInterferenceLine(int *plane, std::size_t stride,
     for (std::size_t index = 0; index < Size; ++index) {
         if (expanded[index] != 1)
             continue;
-        const int estimate = truncateFactoryFloat(
+        const int estimate = truncateInterferenceFloat(
             line.intercept + line.slope * static_cast<float>(predictor[index]));
         plane[index * stride] = wrapSubtract(response[index], estimate);
     }
