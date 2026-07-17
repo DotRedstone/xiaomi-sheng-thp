@@ -45,6 +45,8 @@ constexpr int kPenPressureMax = 8191;
 constexpr size_t kStartupReferenceFrames = 72;
 constexpr auto kStreamStallTimeout = std::chrono::milliseconds(100);
 constexpr std::string_view kFocusPenName = "Xiaomi Focus Pen";
+constexpr std::string_view kFocusPenKeyboardName =
+    "Xiaomi Focus Pen Keyboard";
 
 std::atomic<bool> running = true;
 
@@ -238,6 +240,28 @@ struct PenState {
     int tilt_y = 0;
 };
 
+struct PenButtons {
+    bool button1 = false;
+    bool button2 = false;
+};
+
+bool updatePenButtons(PenButtons &buttons, const input_event &event) {
+    if (event.type != EV_KEY)
+        return false;
+    bool *button = nullptr;
+    if (event.code == KEY_PAGEDOWN)
+        button = &buttons.button1;
+    else if (event.code == KEY_PAGEUP)
+        button = &buttons.button2;
+    if (!button)
+        return false;
+    const bool pressed = event.value != 0;
+    if (*button == pressed)
+        return false;
+    *button = pressed;
+    return true;
+}
+
 class UInputPen {
 public:
     UInputPen() {
@@ -279,6 +303,7 @@ public:
         if (fd_ < 0)
             return;
         try {
+            reportButtons({});
             report({});
         } catch (...) {
         }
@@ -299,8 +324,8 @@ public:
         const bool contact = state.active && state.contact;
         event(EV_KEY, BTN_TOOL_PEN, state.active);
         event(EV_KEY, BTN_TOUCH, contact);
-        event(EV_KEY, BTN_STYLUS, 0);
-        event(EV_KEY, BTN_STYLUS2, 0);
+        event(EV_KEY, BTN_STYLUS, buttons_.button1);
+        event(EV_KEY, BTN_STYLUS2, buttons_.button2);
         if (state.active) {
             event(EV_ABS, ABS_X, state.x);
             event(EV_ABS, ABS_Y, state.y);
@@ -316,8 +341,23 @@ public:
         writeInputEvents(fd_, events.data(), event_count);
     }
 
+    void reportButtons(const PenButtons &buttons) {
+        buttons_ = buttons;
+        std::array<input_event, 3> events{};
+        events[0].type = EV_KEY;
+        events[0].code = BTN_STYLUS;
+        events[0].value = buttons_.button1;
+        events[1].type = EV_KEY;
+        events[1].code = BTN_STYLUS2;
+        events[1].value = buttons_.button2;
+        events[2].type = EV_SYN;
+        events[2].code = SYN_REPORT;
+        writeInputEvents(fd_, events.data(), events.size());
+    }
+
 private:
     int fd_ = -1;
+    PenButtons buttons_{};
 
     void checkedIoctl(unsigned long request, unsigned long value) {
         if (ioctl(fd_, request, value) < 0)
@@ -349,25 +389,40 @@ class FocusPenHidReader {
 public:
     ~FocusPenHidReader() {
         closeHidraw();
-        closeEvent();
+        closePressureEvent();
+        closeButtonEvent();
     }
 
-    void service(nvt::FocusPenPressureQueue &queue) {
+    std::optional<PenButtons> service(nvt::FocusPenPressureQueue &queue) {
         const auto now = std::chrono::steady_clock::now();
         if (now >= next_scan_) {
             next_scan_ = now + std::chrono::seconds(1);
             if (hidraw_fd_ < 0)
                 openHidraw();
-            if (event_fd_ < 0)
+            if (pressure_event_fd_ < 0)
                 grabReportEvent();
+            if (button_event_fd_ < 0)
+                grabButtonEvent();
         }
         drainHidraw(queue);
-        drainEvent();
+        drainPressureEvent();
+        drainButtonEvent();
+        if (!button_update_pending_)
+            return std::nullopt;
+        button_update_pending_ = false;
+        return buttons_;
+    }
+
+    int buttonEventFd() const {
+        return button_event_fd_;
     }
 
 private:
     int hidraw_fd_ = -1;
-    int event_fd_ = -1;
+    int pressure_event_fd_ = -1;
+    int button_event_fd_ = -1;
+    PenButtons buttons_{};
+    bool button_update_pending_ = false;
     std::chrono::steady_clock::time_point next_scan_{};
 
     void openHidraw() {
@@ -411,9 +466,37 @@ private:
                 close(fd);
                 continue;
             }
-            event_fd_ = fd;
+            pressure_event_fd_ = fd;
             std::cerr << "claimed Focus Pen report-5 evdev transport ("
                       << path << "); keypad-plus events suppressed\n";
+            return;
+        }
+    }
+
+    void grabButtonEvent() {
+        std::error_code error;
+        std::vector<std::filesystem::path> entries;
+        for (const auto &entry : std::filesystem::directory_iterator(
+                 "/sys/class/input", error)) {
+            if (entry.path().filename().string().starts_with("event"))
+                entries.push_back(entry.path());
+        }
+        std::sort(entries.begin(), entries.end());
+        for (const auto &entry : entries) {
+            if (readFirstLine(entry / "device/name") !=
+                kFocusPenKeyboardName)
+                continue;
+            const std::string path = "/dev/input/" + entry.filename().string();
+            const int fd = open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+            if (fd < 0)
+                continue;
+            if (ioctl(fd, EVIOCGRAB, 1) < 0) {
+                close(fd);
+                continue;
+            }
+            button_event_fd_ = fd;
+            std::cerr << "claimed Focus Pen button evdev transport ("
+                      << path << "); PageDown/PageUp mapped to stylus buttons\n";
             return;
         }
     }
@@ -436,17 +519,44 @@ private:
         }
     }
 
-    void drainEvent() {
-        if (event_fd_ < 0)
+    void drainPressureEvent() {
+        if (pressure_event_fd_ < 0)
             return;
         std::array<input_event, 32> events{};
         while (true) {
-            const ssize_t size = read(event_fd_, events.data(), sizeof(events));
+            const ssize_t size = read(
+                pressure_event_fd_, events.data(), sizeof(events));
             if (size > 0)
                 continue;
             if (size < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
                 return;
-            closeEvent();
+            closePressureEvent();
+            return;
+        }
+    }
+
+    void drainButtonEvent() {
+        if (button_event_fd_ < 0)
+            return;
+        std::array<input_event, 32> events{};
+        while (true) {
+            const ssize_t size = read(
+                button_event_fd_, events.data(), sizeof(events));
+            if (size > 0) {
+                if (size % static_cast<ssize_t>(sizeof(input_event)) != 0) {
+                    closeButtonEvent();
+                    return;
+                }
+                const size_t count = static_cast<size_t>(size) / sizeof(input_event);
+                for (size_t index = 0; index < count; ++index) {
+                    if (updatePenButtons(buttons_, events[index]))
+                        button_update_pending_ = true;
+                }
+                continue;
+            }
+            if (size < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+                return;
+            closeButtonEvent();
             return;
         }
     }
@@ -457,12 +567,24 @@ private:
         hidraw_fd_ = -1;
     }
 
-    void closeEvent() {
-        if (event_fd_ >= 0) {
-            ioctl(event_fd_, EVIOCGRAB, 0);
-            close(event_fd_);
+    void closePressureEvent() {
+        if (pressure_event_fd_ >= 0) {
+            ioctl(pressure_event_fd_, EVIOCGRAB, 0);
+            close(pressure_event_fd_);
         }
-        event_fd_ = -1;
+        pressure_event_fd_ = -1;
+    }
+
+    void closeButtonEvent() {
+        if (button_event_fd_ >= 0) {
+            ioctl(button_event_fd_, EVIOCGRAB, 0);
+            close(button_event_fd_);
+        }
+        button_event_fd_ = -1;
+        if (buttons_.button1 || buttons_.button2) {
+            buttons_ = {};
+            button_update_pending_ = true;
+        }
     }
 };
 
@@ -650,10 +772,19 @@ int main() try {
         bool stream_stalled = false;
         auto last_valid_frame = std::chrono::steady_clock::now();
         StreamReader reader(stream_fd);
+        auto servicePenTransport = [&]() {
+            const auto buttons = pen_transport.service(pen_pressure);
+            if (buttons && pen)
+                pen->reportButtons(*buttons);
+        };
         while (running) {
-            pen_transport.service(pen_pressure);
-            pollfd descriptor{stream_fd, POLLIN, 0};
-            const int status = poll(&descriptor, 1, 100);
+            servicePenTransport();
+            std::array<pollfd, 2> descriptors{
+                pollfd{stream_fd, POLLIN, 0},
+                pollfd{pen_transport.buttonEventFd(), POLLIN, 0},
+            };
+            const int status = poll(
+                descriptors.data(), descriptors.size(), 100);
             if (status < 0) {
                 if (errno == EINTR)
                     continue;
@@ -661,7 +792,10 @@ int main() try {
                                          std::strerror(errno));
             }
             if (status > 0) {
-                pen_transport.service(pen_pressure);
+                servicePenTransport();
+            }
+            if (status > 0 &&
+                (descriptors[0].revents & (POLLIN | POLLERR | POLLHUP))) {
                 reader.readAvailable([&](uint64_t timestamp,
                                          const uint8_t *frame,
                                          size_t frame_length) {
