@@ -4,7 +4,9 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
+#include <limits>
 
 namespace nvt {
 namespace {
@@ -14,10 +16,16 @@ constexpr std::size_t kPayloadDataTypeOffset = 0x38;
 constexpr std::size_t kSpecialSourceOffset = 0x40;
 constexpr std::size_t kSpecialHeaderSize = 36;
 constexpr std::size_t kSpecialStateOffset = 16;
+constexpr std::size_t kMutualBlockIndexOffset = 11;
 constexpr std::size_t kPlaneBytes = kStylusPlaneNodes * sizeof(std::int16_t);
 constexpr std::size_t kPlaneOffset =
     kTransportSize + kSpecialSourceOffset + kSpecialHeaderSize;
-constexpr std::size_t kRequiredSize = kPlaneOffset + 4 * kPlaneBytes;
+constexpr std::size_t kMutualBlockOffset =
+    kTransportSize + 0xf78;
+constexpr std::size_t kMutualBlockBytes =
+    kStylusMutualBlockNodes * sizeof(std::int16_t);
+constexpr std::size_t kRequiredSize =
+    kMutualBlockOffset + kMutualBlockBytes;
 constexpr std::size_t kTip1CandidateColumns = 12;
 constexpr std::size_t kTip2CandidateRows = 8;
 constexpr int kSuperResolution = 10;
@@ -44,6 +52,113 @@ constexpr std::array<int, kStylusAxis60Nodes> kAxis60Mapping = {
 };
 constexpr std::array<int, 6> kTiltDifferences = {0, 50, 65, 87, 101, 108};
 constexpr std::array<int, 6> kTiltAngles = {0, 1500, 3000, 4500, 6000, 7000};
+
+int wrapAdd(int first, int second) {
+    const std::uint32_t value = std::bit_cast<std::uint32_t>(first) +
+                                std::bit_cast<std::uint32_t>(second);
+    return std::bit_cast<std::int32_t>(value);
+}
+
+int wrapSubtract(int first, int second) {
+    const std::uint32_t value = std::bit_cast<std::uint32_t>(first) -
+                                std::bit_cast<std::uint32_t>(second);
+    return std::bit_cast<std::int32_t>(value);
+}
+
+int wrapMultiply(int first, int second) {
+    const std::uint32_t value = std::bit_cast<std::uint32_t>(first) *
+                                std::bit_cast<std::uint32_t>(second);
+    return std::bit_cast<std::int32_t>(value);
+}
+
+struct InterferenceLine {
+    float intercept = 0.0F;
+    float slope = 0.0F;
+};
+
+int truncateFactoryFloat(float value) {
+    if (std::isnan(value))
+        return 0;
+    if (value >= static_cast<float>(std::numeric_limits<int>::max()))
+        return std::numeric_limits<int>::max();
+    if (value <= static_cast<float>(std::numeric_limits<int>::min()))
+        return std::numeric_limits<int>::min();
+    return static_cast<int>(value);
+}
+
+template <std::size_t Size>
+InterferenceLine fitInterferenceLine(const std::array<int, Size> &response,
+                                     const std::array<int, Size> &predictor,
+                                     const std::array<int, Size> &mask) {
+    int count = 0;
+    int predictor_sum = 0;
+    int response_sum = 0;
+    int predictor_square_sum = 0;
+    int product_sum = 0;
+    for (std::size_t index = 0; index < Size; ++index) {
+        if (mask[index] != 1)
+            continue;
+        ++count;
+        predictor_sum = wrapAdd(predictor_sum, predictor[index]);
+        response_sum = wrapAdd(response_sum, response[index]);
+        predictor_square_sum = wrapAdd(
+            predictor_square_sum,
+            wrapMultiply(predictor[index], predictor[index]));
+        product_sum = wrapAdd(
+            product_sum, wrapMultiply(response[index], predictor[index]));
+    }
+
+    const int denominator_integer = wrapSubtract(
+        wrapMultiply(count, predictor_square_sum),
+        wrapMultiply(predictor_sum, predictor_sum));
+    const float denominator = static_cast<float>(denominator_integer);
+    const float intercept = static_cast<float>(wrapSubtract(
+        wrapMultiply(response_sum, predictor_square_sum),
+        wrapMultiply(product_sum, predictor_sum))) / denominator;
+    const float slope = static_cast<float>(wrapSubtract(
+        wrapMultiply(count, product_sum),
+        wrapMultiply(predictor_sum, response_sum))) / denominator;
+    return {intercept, slope};
+}
+
+template <std::size_t Size>
+void subtractInterferenceLine(int *plane, std::size_t stride,
+                              const std::array<int, Size> &projection) {
+    std::array<int, Size> response{};
+    std::array<int, Size> predictor = projection;
+    std::array<int, Size> selected{};
+    std::array<int, Size> expanded{};
+    for (std::size_t index = 0; index < Size; ++index)
+        response[index] = plane[index * stride];
+
+    for (std::size_t index = 0; index < Size; ++index) {
+        if (predictor[index] <= 200)
+            continue;
+        if ((index > 0 && predictor[index - 1] > 200) ||
+            (index + 1 < Size && predictor[index + 1] > 200))
+            selected[index] = 1;
+    }
+    for (std::size_t index = 0; index < Size; ++index) {
+        if (selected[index] != 1)
+            continue;
+        if (index > 0)
+            expanded[index - 1] = 1;
+        if (index + 1 < Size)
+            expanded[index + 1] = 1;
+    }
+    for (int &value : predictor)
+        value /= 10;
+
+    const InterferenceLine line = fitInterferenceLine(
+        response, predictor, expanded);
+    for (std::size_t index = 0; index < Size; ++index) {
+        if (expanded[index] != 1)
+            continue;
+        const int estimate = truncateFactoryFloat(
+            line.intercept + line.slope * static_cast<float>(predictor[index]));
+        plane[index * stride] = wrapSubtract(response[index], estimate);
+    }
+}
 
 int frameIntervalFromMode(std::uint8_t mode) {
     switch (mode) {
@@ -460,12 +575,105 @@ bool parseRawStylusFrame(const std::uint8_t *frame, std::size_t frame_size,
     const std::uint8_t *header = frame + kTransportSize + kSpecialSourceOffset;
     output.frame_interval = frameIntervalFromMode(
         frame[kTransportSize + 0x3d]);
+    output.mutual_block = header[kMutualBlockIndexOffset];
     output.special_state = header[kSpecialStateOffset] != 0;
     readPlane(source, output.tip_x);
     readPlane(source + kPlaneBytes, output.tip_y);
     readPlane(source + 2 * kPlaneBytes, output.ring_x);
     readPlane(source + 3 * kPlaneBytes, output.ring_y);
+    readPlane(frame + kMutualBlockOffset, output.mutual_block_values);
     return true;
+}
+
+void StylusMutualAssembler::setOrdinaryMatrix(
+    const StylusMutualMatrix &matrix) {
+    matrix_ = matrix;
+    ready_ = true;
+}
+
+void StylusMutualAssembler::ingest(const RawStylusFrame &raw) {
+    if (raw.mutual_block < 1 || raw.mutual_block > 4)
+        return;
+    block_sum_ += raw.mutual_block;
+    const std::size_t first =
+        (raw.mutual_block - 1) * kStylusMutualBlockNodes;
+    std::copy(raw.mutual_block_values.begin(),
+              raw.mutual_block_values.end(), staging_.begin() + first);
+    if (raw.mutual_block != 4)
+        return;
+    if (block_sum_ == 10) {
+        matrix_ = staging_;
+        ready_ = true;
+    }
+    block_sum_ = 0;
+}
+
+void preprocessStylusInterference(RawStylusFrame &raw,
+                                  const StylusMutualMatrix &touch_delta,
+                                  bool ring_enabled) {
+    constexpr std::size_t kGroupSize = 5;
+    constexpr std::size_t kRowGroups =
+        kStylusMutualRows / kGroupSize;
+    constexpr std::size_t kColumnGroups =
+        kStylusMutualColumns / kGroupSize;
+
+    StylusMutualMatrix working_delta{};
+    for (std::size_t row = 0; row < kStylusMutualRows; ++row)
+        for (std::size_t column = 0; column < kStylusMutualColumns; ++column)
+            working_delta[column * kStylusMutualRows + row] =
+                touch_delta[row * kStylusMutualColumns + column];
+
+    std::array<std::array<int, kStylusMutualColumns>, kRowGroups>
+        row_projections{};
+    std::array<bool, kRowGroups> active_rows{};
+    for (std::size_t node = 0; node < kStylusMutualColumns; ++node) {
+        for (std::size_t source = 0; source < kStylusMutualRows; ++source) {
+            const std::size_t group = source / kGroupSize;
+            int &sum = row_projections[group][node];
+            sum = wrapAdd(
+                sum, working_delta[node + source * kStylusMutualColumns]);
+            if (sum > 300)
+                active_rows[group] = true;
+        }
+    }
+    for (std::size_t group = 0; group < kRowGroups; ++group) {
+        if (!active_rows[group])
+            continue;
+        subtractInterferenceLine(
+            raw.tip_y.data() + group * kStylusAxis60Nodes, 1,
+            row_projections[group]);
+        if (ring_enabled) {
+            subtractInterferenceLine(
+                raw.ring_y.data() + group * kStylusAxis60Nodes, 1,
+                row_projections[group]);
+        }
+    }
+
+    std::array<std::array<int, kStylusMutualRows>, kColumnGroups>
+        column_projections{};
+    std::array<bool, kColumnGroups> active_columns{};
+    for (std::size_t node = 0; node < kStylusMutualRows; ++node) {
+        for (std::size_t source = 0; source < kStylusMutualColumns; ++source) {
+            const std::size_t group = source / kGroupSize;
+            int &sum = column_projections[group][node];
+            sum = wrapAdd(
+                sum, working_delta[node * kStylusMutualColumns + source]);
+            if (sum > 300)
+                active_columns[group] = true;
+        }
+    }
+    for (std::size_t group = 0; group < kColumnGroups; ++group) {
+        if (!active_columns[group])
+            continue;
+        subtractInterferenceLine(
+            raw.tip_x.data() + group, kColumnGroups,
+            column_projections[group]);
+        if (ring_enabled) {
+            subtractInterferenceLine(
+                raw.ring_x.data() + group, kColumnGroups,
+                column_projections[group]);
+        }
+    }
 }
 
 bool TipGateState::accept(int energy_40, int energy_60) {

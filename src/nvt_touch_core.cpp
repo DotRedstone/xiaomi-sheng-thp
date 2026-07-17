@@ -137,6 +137,59 @@ Matrix domainFrameHistoryFilter(const Matrix &delta, int matrix_maximum) {
     return filtered;
 }
 
+Matrix persistentDomainFrameHistoryFilter(const Matrix &delta,
+                                          int matrix_maximum) {
+    Matrix source{};
+    Matrix filtered{};
+    for (int row = 0; row < kRows; ++row) {
+        for (int column = 0; column < kColumns; ++column) {
+            const int input = row * kColumns + column;
+            const int internal = column * kRows + row;
+            source[internal] = delta[input];
+            filtered[internal] =
+                delta[input] >= kNoiseThreshold ? delta[input] : 0;
+        }
+    }
+    if (matrix_maximum >= kPeakThreshold + 100) {
+        constexpr std::array<int, 8> first_offsets = {
+            -1, -1, 0, 1, 1, 1, 0, -1};
+        constexpr std::array<int, 8> second_offsets = {
+            0, -1, -1, -1, 0, 1, 1, 1};
+        for (int second = 1; second < kRows - 1; ++second) {
+            for (int first = 1; first < kColumns - 1; ++first) {
+                const int index = second * kColumns + first;
+                const int current = source[index];
+                if (current < 1)
+                    continue;
+                int similar_low = 0;
+                int large_gap = 0;
+                for (std::size_t offset = 0;
+                     offset < first_offsets.size(); ++offset) {
+                    const int neighbor = source[
+                        (second + second_offsets[offset]) * kColumns +
+                        first + first_offsets[offset]];
+                    if (neighbor < 1)
+                        continue;
+                    const int difference = std::abs(current - neighbor);
+                    if (difference < 38 && neighbor < 160)
+                        ++similar_low;
+                    if (difference > kPeakThreshold)
+                        ++large_gap;
+                }
+                if (similar_low > 2 ||
+                    (similar_low > 1 && large_gap == 0))
+                    filtered[index] = 0;
+            }
+        }
+    }
+    Matrix output{};
+    for (int row = 0; row < kRows; ++row)
+        for (int column = 0; column < kColumns; ++column)
+            output[row * kColumns + column] =
+                filtered[column * kRows + row];
+    return output;
+}
+
 std::vector<Profile> projectionProfiles(const Matrix &filtered, int method) {
     const int line_count = method == 2 ? kColumns : kRows;
     const int line_width = method == 2 ? kRows : kColumns;
@@ -401,6 +454,22 @@ std::vector<Peak> localPeaks(const Matrix &delta) {
             peaks.push_back(Peak{index, value});
     }
     return peaks;
+}
+
+bool hasLocalPeak(const Matrix &delta) {
+    for (int index = 0; index < kNodes; ++index) {
+        const int value = delta[index];
+        if (value < kPeakThreshold)
+            continue;
+        bool maximum = true;
+        forNeighbors8(index, [&](int neighbor) {
+            if (value < delta[neighbor])
+                maximum = false;
+        });
+        if (maximum)
+            return true;
+    }
+    return false;
 }
 
 int positiveCrossAverage(const Matrix &delta, int index) {
@@ -1450,6 +1519,8 @@ FrameResult TouchCore::process(const Matrix &matrix,
     const std::vector<Domain> &processing_domains = result.palm_active
         ? empty_domains : result.domains;
     const Matrix projection_filtered = projectionNoiseFilter(result.delta);
+    result.interference_delta = persistentDomainFrameHistoryFilter(
+        result.delta, matrix_maximum);
     std::vector<Plan> current_plans;
     for (const Domain &domain : processing_domains)
         if (auto plan = peakProjectionPlan(projection_filtered, domain))
@@ -1494,9 +1565,36 @@ FrameResult TouchCore::process(const Matrix &matrix,
         previous_domain_peak_sets_.push_back(peakSet(domain));
     previous_histories_ = std::move(current_histories);
 
+    updateReference(matrix, counter, frame_type, matrix_maximum);
+    return result;
+}
+
+MutualState TouchCore::processMutualState(
+    const Matrix &matrix, std::optional<uint16_t> counter,
+    uint8_t frame_type) {
+    if (!reference_) {
+        reference_ = matrix;
+        last_counter_ = counter;
+    }
+    MutualState state;
+    int matrix_maximum = std::numeric_limits<int>::min();
+    for (int index = 0; index < kNodes; ++index) {
+        state.delta[index] = matrix[index] - (*reference_)[index];
+        matrix_maximum = std::max(matrix_maximum, state.delta[index]);
+    }
+    state.interference = hasLocalPeak(state.delta);
+    state.delta = persistentDomainFrameHistoryFilter(
+        state.delta, matrix_maximum);
+    updateReference(matrix, counter, frame_type, matrix_maximum);
+    return state;
+}
+
+void TouchCore::updateReference(
+    const Matrix &matrix, std::optional<uint16_t> counter,
+    uint8_t frame_type, int matrix_maximum) {
     const bool counter_advanced = !counter || !last_counter_ ||
                                   counter != last_counter_;
-    if (frame_type == 4 && counter_advanced &&
+    if ((frame_type == 2 || frame_type == 4) && counter_advanced &&
         matrix_maximum <= kPeakThreshold) {
         if (base_refresh_count_ < kBaseRefreshDelay)
             ++base_refresh_count_;
@@ -1508,7 +1606,6 @@ FrameResult TouchCore::process(const Matrix &matrix,
         base_refresh_count_ = 0;
     }
     last_counter_ = counter;
-    return result;
 }
 
 }  // namespace nvt

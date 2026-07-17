@@ -76,6 +76,13 @@ int16_t readLeI16(const uint8_t *data) {
     return static_cast<int16_t>(readLe16(data));
 }
 
+nvt::Matrix readTouchMatrix(const uint8_t *frame) {
+    nvt::Matrix matrix{};
+    for (int node = 0; node < nvt::kNodes; ++node)
+        matrix[node] = readLeI16(frame + kMatrixOffset + node * 2);
+    return matrix;
+}
+
 void writeControl(const char *path, int value) {
     const int fd = open(path, O_WRONLY | O_CLOEXEC);
     if (fd < 0)
@@ -466,15 +473,15 @@ public:
 
     Update feed(const nvt::Matrix &matrix, uint16_t counter,
                 uint8_t frame_type, uint64_t timestamp_ns) {
-        if (frame_type == 2) {
-            core_.reset();
-            filter_.reset();
+        if (frame_type != 2 && frame_type != 4)
+            return {};
+        if (frame_type == 2 && !core_.hasReference()) {
             core_.process(matrix, counter, frame_type);
             reference_samples_.clear();
+            interference_delta_.fill(0);
+            interference_active_ = false;
             return {std::nullopt, true};
         }
-        if (frame_type != 4)
-            return {};
         if (!core_.hasReference()) {
             reference_samples_.push_back(matrix);
             if (reference_samples_.size() < kStartupReferenceFrames)
@@ -492,9 +499,13 @@ public:
             filter_.reset();
             core_.process(reference, counter, 2);
             reference_samples_.clear();
+            interference_delta_.fill(0);
+            interference_active_ = false;
             return {std::nullopt, true};
         }
         nvt::FrameResult result = core_.process(matrix, counter, frame_type);
+        interference_delta_ = result.interference_delta;
+        interference_active_ = !result.search_peaks.empty();
         std::array<const nvt::TrackedSlot *, nvt::kFingerSlots> tracked{};
         for (const nvt::TrackedSlot &slot : result.tracked_slots)
             tracked[slot.number] = &slot;
@@ -528,10 +539,30 @@ public:
         core_.processNoTouch();
     }
 
+    void feedStylusMutual(const nvt::Matrix &matrix, uint16_t counter,
+                          uint8_t frame_type) {
+        if (!core_.hasReference())
+            return;
+        nvt::MutualState state =
+            core_.processMutualState(matrix, counter, frame_type);
+        interference_delta_ = state.delta;
+        interference_active_ = state.interference;
+    }
+
+    bool interferenceActive() const {
+        return interference_active_;
+    }
+
+    const nvt::Matrix &interferenceDelta() const {
+        return interference_delta_;
+    }
+
 private:
     nvt::TouchCore core_;
     nvt::FingerFilter filter_;
     std::vector<nvt::Matrix> reference_samples_;
+    nvt::Matrix interference_delta_{};
+    bool interference_active_ = false;
 };
 
 class StreamReader {
@@ -608,6 +639,7 @@ int main() try {
         std::cerr << "waiting for a touch reference frame\n";
         LiveTouchAdapter adapter;
         nvt::StylusDecoder pen_decoder;
+        nvt::StylusMutualAssembler stylus_mutual;
         nvt::FocusPenPressureQueue pen_pressure;
         FocusPenHidReader pen_transport;
         bool touch_active = false;
@@ -649,6 +681,10 @@ int main() try {
                         if (!nvt::parseRawStylusFrame(
                                 frame, frame_length, raw_stylus))
                             throw std::runtime_error("invalid stylus frame");
+                        if (adapter.interferenceActive()) {
+                            nvt::preprocessStylusInterference(
+                                raw_stylus, adapter.interferenceDelta());
+                        }
                         const auto result = pen_decoder.process(raw_stylus);
                         PenState state;
                         if (result.active) {
@@ -665,16 +701,28 @@ int main() try {
                         if (pen && (result.active || pen_active))
                             pen->report(state);
                         pen_active = result.active;
+                        stylus_mutual.ingest(raw_stylus);
+                        if (stylus_mutual.hasMatrix()) {
+                            const uint8_t frame_type =
+                                frame[kTransportLength + 24];
+                            const uint16_t counter =
+                                readLe16(frame + kTransportLength + 2);
+                            adapter.feedStylusMutual(
+                                stylus_mutual.matrix(), counter, frame_type);
+                        }
                         return;
+                    }
+                    if (pen_active) {
+                        if (pen)
+                            pen->report({});
+                        pen_active = false;
                     }
                     const uint8_t frame_type =
                         frame[kTransportLength + 24];
                     const uint16_t counter =
                         readLe16(frame + kTransportLength + 2);
-                    nvt::Matrix matrix{};
-                    for (int node = 0; node < nvt::kNodes; ++node)
-                        matrix[node] = readLeI16(
-                            frame + kMatrixOffset + node * 2);
+                    const nvt::Matrix matrix = readTouchMatrix(frame);
+                    stylus_mutual.setOrdinaryMatrix(matrix);
                     auto update = adapter.feed(
                         matrix, counter, frame_type, timestamp);
                     if (update.baseline_ready) {

@@ -60,6 +60,7 @@ struct TrackedSlot {
 
 struct FrameResult {
     Matrix delta{};
+    Matrix interference_delta{};
     std::vector<Peak> search_peaks;
     std::vector<Peak> peaks;
     std::vector<Domain> domains;
@@ -68,6 +69,11 @@ struct FrameResult {
     std::vector<TrackedSlot> tracked_slots;
     std::vector<Slot> slots;
     bool palm_active = false;
+};
+
+struct MutualState {
+    Matrix delta{};
+    bool interference = false;
 };
 
 class TouchCore {
@@ -79,6 +85,10 @@ public:
     FrameResult process(const Matrix &matrix,
                         std::optional<uint16_t> counter = std::nullopt,
                         uint8_t frame_type = 4);
+    MutualState processMutualState(
+        const Matrix &matrix,
+        std::optional<uint16_t> counter = std::nullopt,
+        uint8_t frame_type = 4);
     bool hasReference() const { return reference_.has_value(); }
     const Matrix &reference() const { return *reference_; }
 
@@ -133,6 +143,9 @@ private:
     std::vector<Slot> updateTracker(
         const std::vector<Contact> &contacts,
         std::vector<TrackedSlot> *tracked_slots = nullptr);
+    void updateReference(const Matrix &matrix,
+                         std::optional<uint16_t> counter,
+                         uint8_t frame_type, int matrix_maximum);
 };
 
 }  // namespace nvt

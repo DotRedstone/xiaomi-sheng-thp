@@ -11,14 +11,37 @@ namespace nvt {
 constexpr std::size_t kStylusPlaneNodes = 480;
 constexpr std::size_t kStylusAxis40Nodes = 40;
 constexpr std::size_t kStylusAxis60Nodes = 60;
+constexpr std::size_t kStylusMutualRows = 40;
+constexpr std::size_t kStylusMutualColumns = 60;
+constexpr std::size_t kStylusMutualNodes =
+    kStylusMutualRows * kStylusMutualColumns;
+constexpr std::size_t kStylusMutualBlockNodes = 600;
+
+using StylusMutualMatrix = std::array<int, kStylusMutualNodes>;
 
 struct RawStylusFrame {
     std::array<int, kStylusPlaneNodes> tip_x{};
     std::array<int, kStylusPlaneNodes> tip_y{};
     std::array<int, kStylusPlaneNodes> ring_x{};
     std::array<int, kStylusPlaneNodes> ring_y{};
+    std::array<int, kStylusMutualBlockNodes> mutual_block_values{};
     int frame_interval = 120;
+    std::uint8_t mutual_block = 0;
     bool special_state = false;
+};
+
+class StylusMutualAssembler {
+public:
+    void setOrdinaryMatrix(const StylusMutualMatrix &matrix);
+    void ingest(const RawStylusFrame &raw);
+    bool hasMatrix() const { return ready_; }
+    const StylusMutualMatrix &matrix() const { return matrix_; }
+
+private:
+    StylusMutualMatrix staging_{};
+    StylusMutualMatrix matrix_{};
+    int block_sum_ = 0;
+    bool ready_ = false;
 };
 
 struct TipAxes {
@@ -151,6 +174,9 @@ private:
 
 bool parseRawStylusFrame(const std::uint8_t *frame, std::size_t frame_size,
                          RawStylusFrame &output);
+void preprocessStylusInterference(RawStylusFrame &raw,
+                                  const StylusMutualMatrix &touch_delta,
+                                  bool ring_enabled = true);
 void separateTipAxes(const RawStylusFrame &raw, TipAxes &output);
 void removeTipBackground(TipAxes &axes);
 void refineTipAxes(TipAxes &axes);
