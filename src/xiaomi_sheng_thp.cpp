@@ -134,6 +134,7 @@ public:
         for (unsigned type : {EV_KEY, EV_ABS})
             checkedIoctl(UI_SET_EVBIT, type);
         checkedIoctl(UI_SET_KEYBIT, BTN_TOUCH);
+        checkedIoctl(UI_SET_KEYBIT, BTN_TOOL_FINGER);
         for (unsigned axis : {ABS_MT_SLOT, ABS_MT_TOUCH_MAJOR,
                               ABS_MT_POSITION_X, ABS_MT_POSITION_Y,
                               ABS_MT_TOOL_TYPE, ABS_MT_TRACKING_ID,
@@ -156,7 +157,7 @@ public:
         setupAxis(fd_, ABS_MT_POSITION_Y, 0, kMaxY, 113);
         setupAxis(fd_, ABS_MT_TOOL_TYPE, 0, MT_TOOL_PALM);
         setupAxis(fd_, ABS_MT_TRACKING_ID, 0, 65535);
-        setupAxis(fd_, ABS_MT_PRESSURE, 0, 1023);
+        setupAxis(fd_, ABS_MT_PRESSURE, 0, 1000);
         if (ioctl(fd_, UI_DEV_CREATE) < 0)
             throw std::runtime_error("UI_DEV_CREATE failed");
         usleep(100000);
@@ -174,7 +175,7 @@ public:
     }
 
     void report(const std::vector<nvt::Slot> &slots) {
-        std::array<input_event, nvt::kFingerSlots * 7 + 2> events;
+        std::array<input_event, nvt::kFingerSlots * 7 + 3> events;
         size_t event_count = 0;
         auto event = [&](uint16_t type, uint16_t code, int32_t value) {
             input_event &input = events[event_count++];
@@ -207,10 +208,11 @@ public:
             event(EV_ABS, ABS_MT_POSITION_Y, kMaxY - contact.y);
             event(EV_ABS, ABS_MT_TOOL_TYPE, MT_TOOL_FINGER);
             event(EV_ABS, ABS_MT_TOUCH_MAJOR,
-                  std::min(255, contact.area * 12));
-            event(EV_ABS, ABS_MT_PRESSURE, std::min(1023, contact.peak));
+                  std::min(255, contact.area));
+            event(EV_ABS, ABS_MT_PRESSURE, 1);
         }
         event(EV_KEY, BTN_TOUCH, slots.empty() ? 0 : 1);
+        event(EV_KEY, BTN_TOOL_FINGER, slots.empty() ? 0 : 1);
         event(EV_SYN, SYN_REPORT, 0);
         writeInputEvents(fd_, events.data(), event_count);
     }

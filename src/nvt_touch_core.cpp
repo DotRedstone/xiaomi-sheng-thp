@@ -335,6 +335,7 @@ Plan peakHistoryPlan(const Matrix &filtered, std::vector<Peak> peaks,
                      int method) {
     const auto profiles = projectionProfiles(filtered, method);
     std::vector<int> coordinates;
+    coordinates.reserve(peaks.size());
     for (const Peak &peak : peaks)
         coordinates.push_back(method == 2 ? peak.index % kColumns
                                            : peak.index / kColumns);
@@ -395,6 +396,7 @@ std::optional<std::vector<Domain>> applyPeakPlan(const Domain &domain,
 std::optional<std::vector<Domain>> applyPreviousGroupLabels(
     const Domain &domain, const std::vector<Domain> &previous_groups) {
     std::vector<Domain> groups;
+    groups.reserve(domain.peaks.size());
     std::set<int> covered_peaks;
     for (const Domain &previous : previous_groups) {
         NodeSet nodes = domain.nodes & previous.nodes;
@@ -420,6 +422,7 @@ std::vector<Domain> projectionPeakGroups(
     const std::vector<Plan> &previous_plans,
     const std::vector<Domain> &previous_groups) {
     std::vector<Domain> groups;
+    groups.reserve(domains.size());
     for (const Domain &domain : domains) {
         std::optional<std::vector<Domain>> split;
         if (const auto plan = peakProjectionPlan(filtered, domain))
@@ -446,6 +449,7 @@ std::vector<Domain> projectionPeakGroups(
 
 std::vector<Peak> localPeaks(const Matrix &delta) {
     std::vector<Peak> peaks;
+    peaks.reserve(32);
     for (int index = 0; index < kNodes; ++index) {
         const int value = delta[index];
         if (value < kPeakThreshold)
@@ -521,6 +525,7 @@ std::vector<Peak> filterEqualAdjacentPeaks(const Matrix &delta,
             enabled[index] = false;
     }
     std::vector<Peak> filtered;
+    filtered.reserve(std::min<std::size_t>(peaks.size(), 32));
     for (size_t index = 0; index < peaks.size() && filtered.size() < 32; ++index)
         if (enabled[index])
             filtered.push_back(peaks[index]);
@@ -538,6 +543,7 @@ std::vector<Domain> connectedDomains(const Matrix &filtered,
     for (size_t index = 0; index < peaks.size(); ++index)
         peak_lookup[peaks[index].index] = static_cast<int>(index);
     std::vector<Domain> domains;
+    domains.reserve(peaks.size());
     std::array<int, kNodes> queue{};
     for (int first = 0; first < kNodes; ++first) {
         if (!remaining[first])
@@ -563,6 +569,7 @@ std::vector<Domain> connectedDomains(const Matrix &filtered,
                 forNeighbors8(current, visit);
         }
         std::vector<Peak> domain_peaks;
+        domain_peaks.reserve(peaks.size());
         for (int index = 0; index < kNodes; ++index)
             if (nodes.test(index) && peak_lookup[index] >= 0)
                 domain_peaks.push_back(peaks[peak_lookup[index]]);
@@ -663,6 +670,7 @@ std::vector<Domain> applyPeakMergeHistory(
         if (group.peaks.size() == 1)
             group_by_peak[group.peaks[0].index] = group;
     std::vector<Domain> selected;
+    selected.reserve(projection_groups.size());
     for (const Domain &domain : domains) {
         const NodeSet domain_peak_set = peakSet(domain);
         if (domain.peaks.size() < 2) {
@@ -942,6 +950,7 @@ std::vector<Domain> coordinatePeakGroups(const std::vector<Domain> &groups,
 
 std::vector<bool> coordinateFringeActive(const std::vector<Domain> &groups) {
     std::vector<Peak> representatives;
+    representatives.reserve(groups.size());
     for (const Domain &group : groups)
         if (!group.peaks.empty())
             representatives.push_back(*std::max_element(
@@ -975,11 +984,11 @@ std::vector<Domain> coordinateFringeGroups(const std::vector<Domain> &groups,
     for (const Domain &group : groups)
         labeled |= group.nodes;
     std::vector<Domain> result = groups;
-    for (size_t group_index = 0; group_index < groups.size(); ++group_index) {
-        if (!active[group_index])
+    for (int index = 0; index < kNodes; ++index) {
+        if (labeled.test(index) || coordinate_delta[index] <= kCoordinateReduce)
             continue;
-        for (int index = 0; index < kNodes; ++index) {
-            if (labeled.test(index) || coordinate_delta[index] <= kCoordinateReduce)
+        for (size_t group_index = 0; group_index < groups.size(); ++group_index) {
+            if (!active[group_index])
                 continue;
             bool adjacent = false;
             forNeighbors4(index, [&](int neighbor) {
@@ -993,8 +1002,8 @@ std::vector<Domain> coordinateFringeGroups(const std::vector<Domain> &groups,
 }
 
 std::optional<Contact> domainContact(const Matrix &delta, const Domain &domain) {
-    long long row_sum = 0;
-    long long column_sum = 0;
+    float row_sum = 0.0F;
+    float column_sum = 0.0F;
     int denominator = 0;
     int peak = 0;
     for (const Peak &item : domain.peaks)
@@ -1004,15 +1013,19 @@ std::optional<Contact> domainContact(const Matrix &delta, const Domain &domain) 
             continue;
         const int weight = std::max(delta[index] - kCoordinateReduce, 0);
         denominator += weight;
-        row_sum += static_cast<long long>(weight) * kRowMap[index / kColumns];
-        column_sum += static_cast<long long>(weight) * kColumnMap[index % kColumns];
+        row_sum += static_cast<float>(
+            weight * kRowMap[index / kColumns] * kSuperResolution);
+        column_sum += static_cast<float>(
+            weight * kColumnMap[index % kColumns] * kSuperResolution);
     }
     if (denominator == 0)
         return std::nullopt;
-    const int x = static_cast<int>(std::nearbyint(
-        static_cast<double>(column_sum) * kSuperResolution / denominator));
-    const int y = static_cast<int>(std::nearbyint(
-        static_cast<double>(row_sum) * kSuperResolution / denominator));
+    const auto coordinate = [denominator](float weighted_sum, int maximum) {
+        const float value = weighted_sum / static_cast<float>(denominator);
+        return std::clamp(static_cast<int>(value + 0.5F), 0, maximum - 1);
+    };
+    const int x = coordinate(column_sum, kLongAxisMaximum);
+    const int y = coordinate(row_sum, kShortAxisMaximum);
     return Contact{domain.label, x, y, peak,
                    static_cast<int>(domain.nodes.count()), denominator,
                    domain.nodes};
@@ -1183,6 +1196,7 @@ void TouchCore::reset() {
     previous_palm_domains_.clear();
     base_refresh_count_ = 0;
     last_counter_.reset();
+    previous_peak_active_ = false;
 }
 
 void TouchCore::decayPalmNoPeaks(int matrix_maximum) {
@@ -1270,6 +1284,7 @@ bool TouchCore::updatePalm(const Matrix &delta,
         detected |= total_area > 720;
 
     std::vector<std::pair<int, int>> previous_coordinates;
+    previous_coordinates.reserve(previous_domains_.size());
     for (const Domain &domain : previous_domains_) {
         if (domain.peaks.empty())
             continue;
@@ -1283,10 +1298,12 @@ bool TouchCore::updatePalm(const Matrix &delta,
     }
 
     std::vector<PalmDomain> current;
+    current.reserve(domains.size());
     const bool was_latched = palm_latched_;
     constexpr int stylus_adjustment = 5;
     for (const Domain &domain : domains) {
         std::vector<std::pair<int, int>> points;
+        points.reserve(domain.nodes.count());
         int maximum_column = 0;
         int maximum_row = 0;
         for (int index = 0; index < kNodes; ++index) {
@@ -1299,6 +1316,7 @@ bool TouchCore::updatePalm(const Matrix &delta,
             maximum_row = std::max(maximum_row, row);
         }
         std::vector<std::pair<int, int>> working;
+        working.reserve(points.size());
         for (auto point : points)
             if (point.first < maximum_column && point.second < maximum_row)
                 working.push_back(point);
@@ -1438,6 +1456,8 @@ std::vector<Slot> TouchCore::updateTracker(
     std::vector<TrackedSlot> *tracked_slots) {
     std::vector<int> active_numbers;
     std::vector<std::pair<int, int>> predictions;
+    active_numbers.reserve(kFingerSlots);
+    predictions.reserve(kFingerSlots);
     for (int number = 0; number < kFingerSlots; ++number) {
         if (!tracker_[number].active)
             continue;
@@ -1471,6 +1491,7 @@ std::vector<Slot> TouchCore::updateTracker(
                                      tracker_[number].contact.y);
     }
     std::vector<std::pair<int, int>> coordinates;
+    coordinates.reserve(contacts.size());
     for (const Contact &contact : contacts)
         coordinates.emplace_back(contact.x, contact.y);
     const auto assignments = minimumDistanceAssignment(predictions, coordinates);
@@ -1488,6 +1509,7 @@ std::vector<Slot> TouchCore::updateTracker(
                                    previous.age + 1};
     }
     std::vector<int> free_numbers;
+    free_numbers.reserve(kFingerSlots);
     for (int number = 0; number < kFingerSlots; ++number)
         if (!tracker_[number].active)
             free_numbers.push_back(number);
@@ -1504,6 +1526,9 @@ std::vector<Slot> TouchCore::updateTracker(
     }
     tracker_ = next;
     std::vector<Slot> visible;
+    visible.reserve(kFingerSlots);
+    if (tracked_slots)
+        tracked_slots->reserve(kFingerSlots);
     for (int number = 0; number < kFingerSlots; ++number) {
         if (!tracker_[number].active)
             continue;
@@ -1535,8 +1560,9 @@ FrameResult TouchCore::process(const Matrix &matrix,
     }
     const Matrix coordinate_delta =
         domainFrameHistoryFilter(result.delta, matrix_maximum);
-    const Matrix coordinate_labels = matrix_maximum >= kPeakThreshold + 100
-        ? coordinate_delta : projectionNoiseFilter(result.delta);
+    const Matrix projection_filtered = projectionNoiseFilter(result.delta);
+    const Matrix &coordinate_labels = matrix_maximum >= kPeakThreshold + 100
+        ? coordinate_delta : projection_filtered;
     const Matrix filtered = strictNoiseFilter(result.delta);
     result.search_peaks = localPeaks(result.delta);
     result.peaks = filterEqualAdjacentPeaks(result.delta, result.search_peaks);
@@ -1546,7 +1572,6 @@ FrameResult TouchCore::process(const Matrix &matrix,
     const std::vector<Domain> empty_domains;
     const std::vector<Domain> &processing_domains = result.palm_active
         ? empty_domains : result.domains;
-    const Matrix projection_filtered = projectionNoiseFilter(result.delta);
     result.interference_delta = persistentDomainFrameHistoryFilter(
         result.delta, matrix_maximum);
     std::vector<Plan> current_plans;
@@ -1573,6 +1598,7 @@ FrameResult TouchCore::process(const Matrix &matrix,
                     [](bool value) { return value; }))
         groups = coordinateFringeGroups(groups, coordinate_delta, fringe_active);
     result.groups = groups;
+    result.contacts.reserve(groups.size());
     for (const Domain &domain : groups) {
         if (auto contact = domainContact(coordinate_delta, domain)) {
             mapContactEdges(*contact);
@@ -1596,7 +1622,8 @@ FrameResult TouchCore::process(const Matrix &matrix,
         previous_domain_peak_sets_.push_back(peakSet(domain));
     previous_histories_ = std::move(current_histories);
 
-    updateReference(matrix, counter, frame_type, matrix_maximum);
+    updateReference(matrix, counter, frame_type, matrix_maximum,
+                    !result.search_peaks.empty());
     return result;
 }
 
@@ -1616,17 +1643,18 @@ MutualState TouchCore::processMutualState(
     state.interference = hasLocalPeak(state.delta);
     state.delta = persistentDomainFrameHistoryFilter(
         state.delta, matrix_maximum);
-    updateReference(matrix, counter, frame_type, matrix_maximum);
+    updateReference(matrix, counter, frame_type, matrix_maximum,
+                    state.interference);
     return state;
 }
 
 void TouchCore::updateReference(
     const Matrix &matrix, std::optional<uint16_t> counter,
-    uint8_t frame_type, int matrix_maximum) {
+    uint8_t frame_type, int matrix_maximum, bool peak_active) {
     const bool counter_advanced = !counter || !last_counter_ ||
                                   counter != last_counter_;
     if ((frame_type == 2 || frame_type == 4) && counter_advanced &&
-        matrix_maximum <= kPeakThreshold) {
+        matrix_maximum <= kPeakThreshold && !previous_peak_active_) {
         if (base_refresh_count_ < kBaseRefreshDelay)
             ++base_refresh_count_;
         else {
@@ -1637,6 +1665,7 @@ void TouchCore::updateReference(
         base_refresh_count_ = 0;
     }
     last_counter_ = counter;
+    previous_peak_active_ = peak_active;
 }
 
 }  // namespace nvt

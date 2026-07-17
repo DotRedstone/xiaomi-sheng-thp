@@ -135,6 +135,7 @@ private:
     std::vector<PalmDomain> previous_palm_domains_;
     int base_refresh_count_ = 0;
     std::optional<uint16_t> last_counter_;
+    bool previous_peak_active_ = false;
 
     void decayPalmNoPeaks(int matrix_maximum);
     bool updatePalm(const Matrix &delta, const std::vector<Peak> &peaks,
@@ -145,7 +146,8 @@ private:
         std::vector<TrackedSlot> *tracked_slots = nullptr);
     void updateReference(const Matrix &matrix,
                          std::optional<uint16_t> counter,
-                         uint8_t frame_type, int matrix_maximum);
+                         uint8_t frame_type, int matrix_maximum,
+                         bool peak_active);
 };
 
 }  // namespace nvt
