@@ -35,6 +35,8 @@ constexpr const char *kControlPath = "/proc/nvt_thp_raw";
 constexpr const char *kStreamPath = "/proc/nvt_thp_stream";
 constexpr const char *kStylusPath = "/proc/nvt_thp_stylus";
 constexpr uint32_t kStreamMagic = 0x3150544e;
+constexpr uint16_t kStreamFlagValid = 1U << 0;
+constexpr uint16_t kStreamFlagEpoch = 1U << 1;
 constexpr size_t kTransportLength = 257;
 constexpr size_t kMatrixOffset = kTransportLength + 0x40;
 constexpr int kMaxX = 30479;
@@ -595,6 +597,14 @@ public:
         bool baseline_ready = false;
     };
 
+    void reset() {
+        core_.reset();
+        filter_.reset();
+        reference_samples_.clear();
+        interference_delta_.fill(0);
+        interference_active_ = false;
+    }
+
     Update feed(const nvt::Matrix &matrix, uint16_t counter,
                 uint8_t frame_type, uint64_t timestamp_ns) {
         if (frame_type != 2 && frame_type != 4)
@@ -619,12 +629,8 @@ public:
                 reference[node] = (values[kStartupReferenceFrames / 2 - 1] +
                                    values[kStartupReferenceFrames / 2]) / 2;
             }
-            core_.reset();
-            filter_.reset();
+            reset();
             core_.process(reference, counter, 2);
-            reference_samples_.clear();
-            interference_delta_.fill(0);
-            interference_active_ = false;
             return {std::nullopt, true};
         }
         nvt::FrameResult result = core_.process(matrix, counter, frame_type);
@@ -721,8 +727,8 @@ public:
             const size_t record_length = header.header_length + header.frame_length;
             if (buffer_.size() - offset < record_length)
                 break;
-            if (header.flags & 1)
-                function(header.timestamp_ns,
+            if (header.flags & kStreamFlagValid)
+                function(header.timestamp_ns, header.flags,
                          buffer_.data() + offset + header.header_length,
                          header.frame_length);
             offset += record_length;
@@ -772,6 +778,20 @@ int main() try {
         bool stream_stalled = false;
         auto last_valid_frame = std::chrono::steady_clock::now();
         StreamReader reader(stream_fd);
+        auto resetPipelines = [&]() {
+            if (touch)
+                touch->report({});
+            if (pen)
+                pen->report({});
+            adapter.reset();
+            pen_decoder.reset();
+            stylus_mutual = {};
+            pen_pressure = {};
+            touch_active = false;
+            pen_active = false;
+            have_valid_frame = false;
+            stream_stalled = false;
+        };
         auto servicePenTransport = [&]() {
             const auto buttons = pen_transport.service(pen_pressure);
             if (buttons && pen)
@@ -797,11 +817,17 @@ int main() try {
             if (status > 0 &&
                 (descriptors[0].revents & (POLLIN | POLLERR | POLLHUP))) {
                 reader.readAvailable([&](uint64_t timestamp,
+                                         uint16_t stream_flags,
                                          const uint8_t *frame,
                                          size_t frame_length) {
                     if (frame_length <
                         kMatrixOffset + nvt::kNodes * sizeof(int16_t))
                         throw std::runtime_error("short THP frame");
+                    if (stream_flags & kStreamFlagEpoch) {
+                        resetPipelines();
+                        std::cerr << "THP controller epoch changed; "
+                                     "waiting for a new reference\n";
+                    }
                     last_valid_frame = std::chrono::steady_clock::now();
                     have_valid_frame = true;
                     if (stream_stalled) {
