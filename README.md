@@ -21,8 +21,10 @@ is only available when the panel is running at 60 Hz or 120 Hz.
   ```
 
 - `/dev/uinput`
-- BlueZ for Xiaomi Focus Pen pressure input
-- A C++20 compiler and GNU Make when building from source
+- BlueZ for Xiaomi Focus Pen input
+- `libssc` for the Focus Pen Pro posture sensor path
+- A C++20 compiler, GNU Make, pkg-config, GLib development files, and libssc
+  development files when building from source
 
 [xiaomi-pen-status](https://github.com/ianchb/xiaomi-pen-status) is recommended for pen detection, Bluetooth connection
 assistance, and refresh-rate notifications. It is optional and is not required

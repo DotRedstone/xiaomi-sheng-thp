@@ -2,7 +2,7 @@
 set -eu
 
 APP=xiaomi-sheng-thp
-VERSION=0.3.7
+VERSION=0.3.9
 ARCH="$(dpkg --print-architecture)"
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 PKGROOT="$(mktemp -d)"
@@ -24,12 +24,13 @@ Version: ${VERSION}
 Section: utils
 Priority: optional
 Architecture: ${ARCH}
-Depends: bluez, libc6, libstdc++6, systemd
+Depends: bluez, libc6, libglib2.0-0t64, libssc, libstdc++6, systemd
 Recommends: xiaomi-pen-status
 Maintainer: siergtc <i@4t.pw>
 Description: NT36532E userspace touch processor for Xiaomi Sheng
- Processes raw NT36532E THP frames and reports multitouch and Xiaomi Focus
- Pen input through uinput. A compatible kernel raw-stream ABI is required.
+ Processes raw NT36532E THP frames and reports multitouch, Xiaomi Focus Pen,
+ and Focus Pen Pro input through uinput. A compatible kernel raw-stream ABI
+ is required.
 EOF
 
 cat > "${PKGROOT}/DEBIAN/postinst" <<'EOF'

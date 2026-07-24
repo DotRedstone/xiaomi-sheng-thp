@@ -19,6 +19,26 @@ constexpr std::size_t kStylusMutualBlockNodes = 600;
 
 using StylusMutualMatrix = std::array<int, kStylusMutualNodes>;
 
+enum class StylusModel {
+    M80p,
+    P81c,
+};
+
+struct StylusProfile {
+    const char *input_name;
+    const char *input_phys;
+    int controller_switch;
+    int maximum_pressure;
+    bool has_brake_axis;
+    std::array<int, 6> coordinate_differences;
+    int calibration_threshold;
+    int calibration_rate;
+    int tip_slope_40;
+    int tip_slope_60;
+};
+
+const StylusProfile &stylusProfile(StylusModel model);
+
 struct RawStylusFrame {
     std::array<int, kStylusPlaneNodes> tip_x{};
     std::array<int, kStylusPlaneNodes> tip_y{};
@@ -98,10 +118,12 @@ struct StylusFrameResult {
 
 class StylusDecoder {
 public:
+    explicit StylusDecoder(StylusModel model);
     void reset();
     StylusFrameResult process(const RawStylusFrame &raw);
 
 private:
+    const StylusProfile *profile_;
     struct FilterPoint {
         int x = 0;
         int y = 0;
@@ -185,6 +207,7 @@ void separateRingAxes(const RawStylusFrame &raw, RingAxes &output);
 void removeRingBackground(RingAxes &axes, int threshold = 200);
 StylusCoordinates calculateStylusCoordinates(const TipAxes &tip,
                                              const RingAxes &ring,
-                                             StylusCoordinateState &state);
+                                             StylusCoordinateState &state,
+                                             const StylusProfile &profile);
 
 }  // namespace nvt
