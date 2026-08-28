@@ -56,7 +56,9 @@ constexpr int kPostureRawPenMaxX = 20319;
 constexpr int kPostureRawPenMaxY = 30479;
 constexpr size_t kStartupReferenceFrames = 72;
 constexpr auto kStreamStallTimeout = std::chrono::milliseconds(100);
+constexpr auto kAirPointerActivityTimeout = std::chrono::milliseconds(750);
 constexpr std::string_view kFocusPenName = "Xiaomi Focus Pen";
+constexpr std::string_view kFocusPenMouseName = "Xiaomi Focus Pen Mouse";
 constexpr std::string_view kFocusPenKeyboardName =
     "Xiaomi Focus Pen Keyboard";
 constexpr std::string_view kFocusPenProName = "Xiaomi Focus Pen Pro";
@@ -258,6 +260,8 @@ struct PenState {
 struct PenButtons {
     bool button1 = false;
     bool button2 = false;
+
+    bool operator==(const PenButtons &) const = default;
 };
 
 bool updatePenButtons(PenButtons &buttons, const input_event &event) {
@@ -413,6 +417,71 @@ private:
             throw std::runtime_error("uinput capability ioctl failed");
     }
 
+};
+
+class UInputAirPointerButtons {
+public:
+    UInputAirPointerButtons() {
+        fd_ = open("/dev/uinput", O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+        if (fd_ < 0)
+            throw std::runtime_error(std::string("open /dev/uinput: ") +
+                                     std::strerror(errno));
+        for (unsigned type : {EV_KEY, EV_REL})
+            checkedIoctl(UI_SET_EVBIT, type);
+        for (unsigned key : {BTN_LEFT, BTN_RIGHT})
+            checkedIoctl(UI_SET_KEYBIT, key);
+        for (unsigned axis : {REL_X, REL_Y})
+            checkedIoctl(UI_SET_RELBIT, axis);
+
+        uinput_setup setup{};
+        setup.id.bustype = BUS_VIRTUAL;
+        setup.id.vendor = 0x2717;
+        setup.id.product = 0x4d80;
+        setup.id.version = 1;
+        std::strncpy(setup.name, "Xiaomi Focus Pen Air Pointer Buttons",
+                     sizeof(setup.name) - 1);
+        if (ioctl(fd_, UI_DEV_SETUP, &setup) < 0)
+            throw std::runtime_error("UI_DEV_SETUP failed");
+        if (ioctl(fd_, UI_DEV_CREATE) < 0)
+            throw std::runtime_error("UI_DEV_CREATE failed");
+        usleep(100000);
+    }
+
+    ~UInputAirPointerButtons() {
+        if (fd_ < 0)
+            return;
+        try {
+            report({});
+        } catch (...) {
+        }
+        ioctl(fd_, UI_DEV_DESTROY);
+        close(fd_);
+    }
+
+    void report(const PenButtons &buttons) {
+        if (buttons == buttons_)
+            return;
+        buttons_ = buttons;
+        std::array<input_event, 3> events{};
+        events[0].type = EV_KEY;
+        events[0].code = BTN_LEFT;
+        events[0].value = buttons_.button1;
+        events[1].type = EV_KEY;
+        events[1].code = BTN_RIGHT;
+        events[1].value = buttons_.button2;
+        events[2].type = EV_SYN;
+        events[2].code = SYN_REPORT;
+        writeInputEvents(fd_, events.data(), events.size());
+    }
+
+private:
+    int fd_ = -1;
+    PenButtons buttons_{};
+
+    void checkedIoctl(unsigned long request, unsigned long value) {
+        if (ioctl(fd_, request, value) < 0)
+            throw std::runtime_error("uinput capability ioctl failed");
+    }
 };
 
 struct ProGestureButtons {
@@ -619,6 +688,7 @@ struct PenTransportUpdate {
     std::optional<nvt::StylusModel> model;
     std::optional<std::string> connected_address;
     std::optional<PenButtons> buttons;
+    std::optional<bool> air_pointer_active;
     std::optional<ProGestureButtons> gestures;
     std::optional<int> brake;
     unsigned double_tap_haptics = 0;
@@ -636,6 +706,7 @@ public:
         closeHidraw();
         closePressureEvent();
         closeButtonEvent();
+        closePointerEvent();
     }
 
     PenTransportUpdate service(nvt::FocusPenPressureQueue &queue,
@@ -649,6 +720,8 @@ public:
                 grabReportEvent();
             if (button_event_fd_ < 0)
                 grabButtonEvent();
+            if (model_ == nvt::StylusModel::M80p && pointer_event_fd_ < 0)
+                openPointerEvent();
         }
         PenTransportUpdate update;
         if (transport_reset_pending_) {
@@ -668,6 +741,8 @@ public:
         drainHidraw(queue, posture);
         drainPressureEvent();
         drainButtonEvent();
+        drainPointerEvent();
+        refreshAirPointerState(std::chrono::steady_clock::now());
         if (button_update_pending_) {
             update.buttons = buttons_;
             button_update_pending_ = false;
@@ -675,6 +750,10 @@ public:
         if (gesture_update_pending_) {
             update.gestures = gestures_;
             gesture_update_pending_ = false;
+        }
+        if (air_pointer_update_pending_) {
+            update.air_pointer_active = air_pointer_active_;
+            air_pointer_update_pending_ = false;
         }
         if (brake_update_) {
             update.brake = brake_update_;
@@ -691,10 +770,15 @@ public:
         return button_event_fd_;
     }
 
+    int pointerEventFd() const {
+        return pointer_event_fd_;
+    }
+
 private:
     int hidraw_fd_ = -1;
     int pressure_event_fd_ = -1;
     int button_event_fd_ = -1;
+    int pointer_event_fd_ = -1;
     nvt::StylusModel model_ = nvt::StylusModel::M80p;
     std::optional<nvt::StylusModel> pending_model_;
     PenButtons buttons_{};
@@ -703,12 +787,16 @@ private:
     bool gesture_update_pending_ = false;
     bool button_resync_pending_ = false;
     bool transport_reset_pending_ = false;
+    bool air_pointer_active_ = false;
+    bool air_pointer_seen_ = false;
+    bool air_pointer_update_pending_ = false;
     std::optional<int> brake_update_;
     unsigned double_tap_haptics_ = 0;
     unsigned slide_haptics_ = 0;
     std::optional<std::string> connected_address_pending_;
     FocusPenIdentity identity_{};
     std::chrono::steady_clock::time_point next_scan_{};
+    std::chrono::steady_clock::time_point last_air_pointer_activity_{};
 
     void openHidraw() {
         std::error_code error;
@@ -826,6 +914,31 @@ private:
         }
     }
 
+    void openPointerEvent() {
+        std::error_code error;
+        std::vector<std::filesystem::path> entries;
+        for (const auto &entry : std::filesystem::directory_iterator(
+                 "/sys/class/input", error)) {
+            if (entry.path().filename().string().starts_with("event"))
+                entries.push_back(entry.path());
+        }
+        std::sort(entries.begin(), entries.end());
+        for (const auto &entry : entries) {
+            const FocusPenIdentity identity = readEvdevIdentity(entry);
+            if (identity.name != kFocusPenMouseName ||
+                !samePhysicalPen(identity_, identity))
+                continue;
+            const std::string path = "/dev/input/" + entry.filename().string();
+            const int fd = open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+            if (fd < 0)
+                continue;
+            pointer_event_fd_ = fd;
+            std::cerr << "watching Focus Pen air-pointer transport ("
+                      << path << "; side buttons become left/right click)\n";
+            return;
+        }
+    }
+
     void drainHidraw(nvt::FocusPenPressureQueue &queue,
                      nvt::PencilPostureDecoder *posture) {
         if (hidraw_fd_ < 0)
@@ -888,6 +1001,49 @@ private:
             closeButtonEvent();
             return;
         }
+    }
+
+    void drainPointerEvent() {
+        if (pointer_event_fd_ < 0)
+            return;
+        std::array<input_event, 32> events{};
+        while (true) {
+            const ssize_t size = read(
+                pointer_event_fd_, events.data(), sizeof(events));
+            if (size > 0) {
+                if (size % static_cast<ssize_t>(sizeof(input_event)) != 0) {
+                    closePointerEvent();
+                    return;
+                }
+                const size_t count = static_cast<size_t>(size) /
+                                     sizeof(input_event);
+                for (size_t index = 0; index < count; ++index) {
+                    const input_event &event = events[index];
+                    if (event.type == EV_REL &&
+                        (event.code == REL_X || event.code == REL_Y) &&
+                        event.value != 0) {
+                        air_pointer_seen_ = true;
+                        last_air_pointer_activity_ =
+                            std::chrono::steady_clock::now();
+                    }
+                }
+                continue;
+            }
+            if (size < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+                return;
+            closePointerEvent();
+            return;
+        }
+    }
+
+    void refreshAirPointerState(
+        std::chrono::steady_clock::time_point now) {
+        const bool active = air_pointer_seen_ &&
+            now - last_air_pointer_activity_ <= kAirPointerActivityTimeout;
+        if (active == air_pointer_active_)
+            return;
+        air_pointer_active_ = active;
+        air_pointer_update_pending_ = true;
     }
 
     static bool keyBitIsSet(const unsigned long *bits, unsigned code) {
@@ -1011,12 +1167,24 @@ private:
         releaseButtonState();
     }
 
+    void closePointerEvent() {
+        if (pointer_event_fd_ >= 0)
+            close(pointer_event_fd_);
+        pointer_event_fd_ = -1;
+        air_pointer_seen_ = false;
+        if (air_pointer_active_) {
+            air_pointer_active_ = false;
+            air_pointer_update_pending_ = true;
+        }
+    }
+
     void selectModel(nvt::StylusModel model) {
         if (model_ == model)
             return;
         closeHidraw();
         closePressureEvent();
         closeButtonEvent();
+        closePointerEvent();
         model_ = model;
         pending_model_ = model;
         std::cerr << "Focus Pen model: " << modelName(model) << '\n';
@@ -1265,6 +1433,7 @@ int main() try {
     std::optional<UInputTouch> touch;
     std::optional<UInputPen> pen_m80p;
     std::optional<UInputPen> pen_p81c;
+    std::optional<UInputAirPointerButtons> air_pointer_buttons;
     std::optional<UInputProGestures> pro_gestures;
     try {
         nvt::StylusModel stylus_model = nvt::StylusModel::M80p;
@@ -1275,6 +1444,7 @@ int main() try {
         touch.emplace();
         pen_m80p.emplace(nvt::StylusModel::M80p);
         pen_p81c.emplace(nvt::StylusModel::P81c);
+        air_pointer_buttons.emplace();
         std::cerr << "touch and pen pipelines ready\n";
         std::cerr << "waiting for a touch reference frame\n";
         LiveTouchAdapter adapter;
@@ -1289,6 +1459,8 @@ int main() try {
         FocusPenHidReader pen_transport;
         bool touch_active = false;
         bool pen_active = false;
+        bool air_pointer_active = false;
+        PenButtons m80p_buttons{};
         bool have_valid_frame = false;
         bool stream_stalled = false;
         auto last_valid_frame = std::chrono::steady_clock::now();
@@ -1304,6 +1476,14 @@ int main() try {
             if (UInputPen *pen = activePen())
                 pen->report({});
         };
+        auto updateAirPointerButtons = [&]() {
+            if (!air_pointer_buttons)
+                return;
+            const bool enabled = stylus_model == nvt::StylusModel::M80p &&
+                                 air_pointer_active && !pen_active;
+            air_pointer_buttons->report(enabled ? m80p_buttons
+                                                : PenButtons{});
+        };
         auto resetPipelines = [&]() {
             if (touch)
                 touch->report({});
@@ -1316,6 +1496,7 @@ int main() try {
                 pencil_posture.reset();
             touch_active = false;
             pen_active = false;
+            updateAirPointerButtons();
             have_valid_frame = false;
             stream_stalled = false;
         };
@@ -1323,6 +1504,9 @@ int main() try {
             if (model == stylus_model)
                 return;
             releaseActivePen();
+            air_pointer_active = false;
+            m80p_buttons = {};
+            updateAirPointerButtons();
             if (stylus_model == nvt::StylusModel::P81c) {
                 p81c_ag_controller.disable();
                 pro_gestures.reset();
@@ -1372,6 +1556,8 @@ int main() try {
                         pen->report({});
                 }
                 pen_active = false;
+                air_pointer_active = false;
+                updateAirPointerButtons();
             }
             if (update.model)
                 switchStylusModel(*update.model);
@@ -1381,9 +1567,13 @@ int main() try {
                     *update.connected_address, display_state.screenOn());
             }
             if (update.buttons) {
+                m80p_buttons = *update.buttons;
                 if (UInputPen *pen = activePen())
                     pen->reportButtons(*update.buttons);
             }
+            if (update.air_pointer_active)
+                air_pointer_active = *update.air_pointer_active;
+            updateAirPointerButtons();
             if (update.gestures && pro_gestures)
                 pro_gestures->report(*update.gestures);
             if (update.brake && stylus_model == nvt::StylusModel::P81c) {
@@ -1404,9 +1594,10 @@ int main() try {
         };
         while (running) {
             servicePenTransport();
-            std::array<pollfd, 2> descriptors{
+            std::array<pollfd, 3> descriptors{
                 pollfd{stream_fd, POLLIN, 0},
                 pollfd{pen_transport.buttonEventFd(), POLLIN, 0},
+                pollfd{pen_transport.pointerEventFd(), POLLIN, 0},
             };
             const int status = poll(
                 descriptors.data(), descriptors.size(), 100);
@@ -1479,6 +1670,7 @@ int main() try {
                                 pen->report(state);
                         }
                         pen_active = result.active;
+                        updateAirPointerButtons();
                         stylus_mutual.ingest(raw_stylus);
                         if (stylus_mutual.hasMatrix()) {
                             const uint8_t frame_type =

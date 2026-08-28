@@ -6,8 +6,11 @@ reads raw THP frames from the kernel and creates standard Linux input devices
 through uinput.
 
 Finger input, multi-touch tracking, palm rejection, pen coordinates, tilt,
-hover, and Bluetooth HID pressure are supported. Please note that pen scanning
-is only available when the panel is running at 60 Hz or 120 Hz.
+hover, Bluetooth HID pressure, and both barrel buttons are supported. While the
+Focus Pen air pointer is moving, its two barrel buttons also act as left and
+right mouse clicks; approaching the screen returns them to normal stylus
+buttons. Please note that pen scanning is only available when the panel is
+running at 60 Hz or 120 Hz.
 
 ## Requirements
 
