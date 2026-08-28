@@ -56,7 +56,7 @@ constexpr int kPostureRawPenMaxX = 20319;
 constexpr int kPostureRawPenMaxY = 30479;
 constexpr size_t kStartupReferenceFrames = 72;
 constexpr auto kStreamStallTimeout = std::chrono::milliseconds(100);
-constexpr auto kAirPointerActivityTimeout = std::chrono::milliseconds(750);
+constexpr auto kAirPointerActivityTimeout = std::chrono::seconds(2);
 constexpr std::string_view kFocusPenName = "Xiaomi Focus Pen";
 constexpr std::string_view kFocusPenMouseName = "Xiaomi Focus Pen Mouse";
 constexpr std::string_view kFocusPenKeyboardName =
@@ -392,6 +392,9 @@ public:
         events[2].type = EV_SYN;
         events[2].code = SYN_REPORT;
         writeInputEvents(fd_, events.data(), events.size());
+        std::cerr << "Focus Pen air-pointer buttons: left="
+                  << buttons_.button1 << " right=" << buttons_.button2
+                  << '\n';
     }
 
     void reportBrake(int angle) {
@@ -1044,6 +1047,8 @@ private:
             return;
         air_pointer_active_ = active;
         air_pointer_update_pending_ = true;
+        std::cerr << "Focus Pen air pointer "
+                  << (active ? "active" : "inactive") << '\n';
     }
 
     static bool keyBitIsSet(const unsigned long *bits, unsigned code) {
@@ -1067,8 +1072,12 @@ private:
             return;
         }
         if (model_ == nvt::StylusModel::M80p) {
-            if (updatePenButtons(buttons_, event))
+            if (updatePenButtons(buttons_, event)) {
                 button_update_pending_ = true;
+                std::cerr << "Focus Pen barrel buttons: primary="
+                          << buttons_.button1
+                          << " secondary=" << buttons_.button2 << '\n';
+            }
             return;
         }
         if (event.type != EV_KEY || (event.value != 0 && event.value != 1))
