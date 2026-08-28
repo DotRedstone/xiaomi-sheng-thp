@@ -392,9 +392,6 @@ public:
         events[2].type = EV_SYN;
         events[2].code = SYN_REPORT;
         writeInputEvents(fd_, events.data(), events.size());
-        std::cerr << "Focus Pen air-pointer buttons: left="
-                  << buttons_.button1 << " right=" << buttons_.button2
-                  << '\n';
     }
 
     void reportBrake(int angle) {
@@ -475,6 +472,9 @@ public:
         events[2].type = EV_SYN;
         events[2].code = SYN_REPORT;
         writeInputEvents(fd_, events.data(), events.size());
+        std::cerr << "Focus Pen air-pointer buttons: left="
+                  << buttons_.button1 << " right=" << buttons_.button2
+                  << '\n';
     }
 
 private:
@@ -773,7 +773,9 @@ public:
     }
 
     bool airPointerActive() const {
-        return air_pointer_active_;
+        return air_pointer_seen_ &&
+            std::chrono::steady_clock::now() - last_air_pointer_activity_ <=
+                kAirPointerActivityTimeout;
     }
 
 private:
