@@ -691,7 +691,6 @@ struct PenTransportUpdate {
     std::optional<nvt::StylusModel> model;
     std::optional<std::string> connected_address;
     std::optional<PenButtons> buttons;
-    std::optional<bool> air_pointer_active;
     std::optional<ProGestureButtons> gestures;
     std::optional<int> brake;
     unsigned double_tap_haptics = 0;
@@ -754,10 +753,6 @@ public:
             update.gestures = gestures_;
             gesture_update_pending_ = false;
         }
-        if (air_pointer_update_pending_) {
-            update.air_pointer_active = air_pointer_active_;
-            air_pointer_update_pending_ = false;
-        }
         if (brake_update_) {
             update.brake = brake_update_;
             brake_update_.reset();
@@ -777,6 +772,10 @@ public:
         return pointer_event_fd_;
     }
 
+    bool airPointerActive() const {
+        return air_pointer_active_;
+    }
+
 private:
     int hidraw_fd_ = -1;
     int pressure_event_fd_ = -1;
@@ -792,7 +791,6 @@ private:
     bool transport_reset_pending_ = false;
     bool air_pointer_active_ = false;
     bool air_pointer_seen_ = false;
-    bool air_pointer_update_pending_ = false;
     std::optional<int> brake_update_;
     unsigned double_tap_haptics_ = 0;
     unsigned slide_haptics_ = 0;
@@ -1046,7 +1044,6 @@ private:
         if (active == air_pointer_active_)
             return;
         air_pointer_active_ = active;
-        air_pointer_update_pending_ = true;
         std::cerr << "Focus Pen air pointer "
                   << (active ? "active" : "inactive") << '\n';
     }
@@ -1181,10 +1178,7 @@ private:
             close(pointer_event_fd_);
         pointer_event_fd_ = -1;
         air_pointer_seen_ = false;
-        if (air_pointer_active_) {
-            air_pointer_active_ = false;
-            air_pointer_update_pending_ = true;
-        }
+        air_pointer_active_ = false;
     }
 
     void selectModel(nvt::StylusModel model) {
@@ -1468,7 +1462,6 @@ int main() try {
         FocusPenHidReader pen_transport;
         bool touch_active = false;
         bool pen_active = false;
-        bool air_pointer_active = false;
         PenButtons m80p_buttons{};
         bool have_valid_frame = false;
         bool stream_stalled = false;
@@ -1489,7 +1482,8 @@ int main() try {
             if (!air_pointer_buttons)
                 return;
             const bool enabled = stylus_model == nvt::StylusModel::M80p &&
-                                 air_pointer_active && !pen_active;
+                                 pen_transport.airPointerActive() &&
+                                 !pen_active;
             air_pointer_buttons->report(enabled ? m80p_buttons
                                                 : PenButtons{});
         };
@@ -1513,7 +1507,6 @@ int main() try {
             if (model == stylus_model)
                 return;
             releaseActivePen();
-            air_pointer_active = false;
             m80p_buttons = {};
             updateAirPointerButtons();
             if (stylus_model == nvt::StylusModel::P81c) {
@@ -1565,7 +1558,6 @@ int main() try {
                         pen->report({});
                 }
                 pen_active = false;
-                air_pointer_active = false;
                 updateAirPointerButtons();
             }
             if (update.model)
@@ -1580,8 +1572,6 @@ int main() try {
                 if (UInputPen *pen = activePen())
                     pen->reportButtons(*update.buttons);
             }
-            if (update.air_pointer_active)
-                air_pointer_active = *update.air_pointer_active;
             updateAirPointerButtons();
             if (update.gestures && pro_gestures)
                 pro_gestures->report(*update.gestures);
