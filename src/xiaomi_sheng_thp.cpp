@@ -735,8 +735,11 @@ public:
             throw std::runtime_error(std::string("bind button mapping socket: ") +
                                      std::strerror(saved_errno));
         }
-        if (const group *input_group = getgrnam("input"))
-            chown(kButtonMappingSocket, 0, input_group->gr_gid);
+        if (const group *input_group = getgrnam("input")) {
+            if (chown(kButtonMappingSocket, 0, input_group->gr_gid) < 0)
+                std::cerr << "button mapping socket chown failed: "
+                          << std::strerror(errno) << '\n';
+        }
         if (chmod(kButtonMappingSocket, 0660) < 0)
             std::cerr << "button mapping socket chmod failed: "
                       << std::strerror(errno) << '\n';
