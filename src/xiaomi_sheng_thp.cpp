@@ -19,6 +19,7 @@
 #include <filesystem>
 #include <fcntl.h>
 #include <fstream>
+#include <grp.h>
 #include <iostream>
 #include <glib.h>
 extern "C" {
@@ -28,9 +29,13 @@ extern "C" {
 #include <linux/uinput.h>
 #include <optional>
 #include <poll.h>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
 #include <utility>
@@ -41,6 +46,8 @@ namespace {
 constexpr const char *kControlPath = "/proc/nvt_thp_raw";
 constexpr const char *kStreamPath = "/proc/nvt_thp_stream";
 constexpr const char *kStylusPath = "/proc/nvt_thp_stylus";
+constexpr const char *kButtonMappingSocket =
+    "/run/xiaomi-sheng-thp/button-mapping.sock";
 constexpr uint32_t kStreamMagic = 0x3150544e;
 constexpr uint16_t kStreamFlagValid = 1U << 0;
 constexpr uint16_t kStreamFlagEpoch = 1U << 1;
@@ -264,6 +271,136 @@ struct PenButtons {
     bool operator==(const PenButtons &) const = default;
 };
 
+enum class ButtonAction {
+    Native,
+    LeftClick,
+    RightClick,
+    MiddleClick,
+    Back,
+    Forward,
+    Undo,
+    Redo,
+    Screenshot,
+    Overview,
+    Disabled,
+};
+
+struct ButtonContextMapping {
+    ButtonAction primary = ButtonAction::Native;
+    ButtonAction secondary = ButtonAction::Native;
+
+    bool operator==(const ButtonContextMapping &) const = default;
+};
+
+struct ButtonMapping {
+    ButtonContextMapping pen{};
+    ButtonContextMapping air{
+        ButtonAction::LeftClick,
+        ButtonAction::RightClick,
+    };
+
+    bool operator==(const ButtonMapping &) const = default;
+};
+
+struct MouseButtons {
+    bool left = false;
+    bool right = false;
+    bool middle = false;
+    bool back = false;
+    bool forward = false;
+
+    bool operator==(const MouseButtons &) const = default;
+};
+
+using ShortcutKeys = std::array<bool, KEY_MAX + 1>;
+
+std::optional<ButtonAction> parseButtonAction(std::string_view name) {
+    if (name == "native")
+        return ButtonAction::Native;
+    if (name == "left")
+        return ButtonAction::LeftClick;
+    if (name == "right")
+        return ButtonAction::RightClick;
+    if (name == "middle")
+        return ButtonAction::MiddleClick;
+    if (name == "back")
+        return ButtonAction::Back;
+    if (name == "forward")
+        return ButtonAction::Forward;
+    if (name == "undo")
+        return ButtonAction::Undo;
+    if (name == "redo")
+        return ButtonAction::Redo;
+    if (name == "screenshot")
+        return ButtonAction::Screenshot;
+    if (name == "overview")
+        return ButtonAction::Overview;
+    if (name == "disabled")
+        return ButtonAction::Disabled;
+    return std::nullopt;
+}
+
+const char *buttonActionName(ButtonAction action) {
+    switch (action) {
+    case ButtonAction::Native: return "native";
+    case ButtonAction::LeftClick: return "left";
+    case ButtonAction::RightClick: return "right";
+    case ButtonAction::MiddleClick: return "middle";
+    case ButtonAction::Back: return "back";
+    case ButtonAction::Forward: return "forward";
+    case ButtonAction::Undo: return "undo";
+    case ButtonAction::Redo: return "redo";
+    case ButtonAction::Screenshot: return "screenshot";
+    case ButtonAction::Overview: return "overview";
+    case ButtonAction::Disabled: return "disabled";
+    }
+    return "disabled";
+}
+
+void addButtonAction(ButtonAction action, bool pressed, bool primary,
+                     PenButtons &native, MouseButtons &mouse,
+                     ShortcutKeys &keys) {
+    if (!pressed)
+        return;
+    switch (action) {
+    case ButtonAction::Native:
+        (primary ? native.button1 : native.button2) = true;
+        break;
+    case ButtonAction::LeftClick:
+        mouse.left = true;
+        break;
+    case ButtonAction::RightClick:
+        mouse.right = true;
+        break;
+    case ButtonAction::MiddleClick:
+        mouse.middle = true;
+        break;
+    case ButtonAction::Back:
+        mouse.back = true;
+        break;
+    case ButtonAction::Forward:
+        mouse.forward = true;
+        break;
+    case ButtonAction::Undo:
+        keys[KEY_LEFTCTRL] = true;
+        keys[KEY_Z] = true;
+        break;
+    case ButtonAction::Redo:
+        keys[KEY_LEFTCTRL] = true;
+        keys[KEY_LEFTSHIFT] = true;
+        keys[KEY_Z] = true;
+        break;
+    case ButtonAction::Screenshot:
+        keys[KEY_SYSRQ] = true;
+        break;
+    case ButtonAction::Overview:
+        keys[KEY_LEFTMETA] = true;
+        break;
+    case ButtonAction::Disabled:
+        break;
+    }
+}
+
 bool updatePenButtons(PenButtons &buttons, const input_event &event) {
     if (event.type != EV_KEY)
         return false;
@@ -379,7 +516,7 @@ public:
     }
 
     void reportButtons(const PenButtons &buttons) {
-        if (!has_stylus_buttons_)
+        if (!has_stylus_buttons_ || buttons == buttons_)
             return;
         buttons_ = buttons;
         std::array<input_event, 3> events{};
@@ -419,16 +556,17 @@ private:
 
 };
 
-class UInputAirPointerButtons {
+class UInputActionMouse {
 public:
-    UInputAirPointerButtons() {
+    UInputActionMouse() {
         fd_ = open("/dev/uinput", O_WRONLY | O_NONBLOCK | O_CLOEXEC);
         if (fd_ < 0)
             throw std::runtime_error(std::string("open /dev/uinput: ") +
                                      std::strerror(errno));
         for (unsigned type : {EV_KEY, EV_REL})
             checkedIoctl(UI_SET_EVBIT, type);
-        for (unsigned key : {BTN_LEFT, BTN_RIGHT})
+        for (unsigned key : {BTN_LEFT, BTN_RIGHT, BTN_MIDDLE,
+                             BTN_SIDE, BTN_EXTRA})
             checkedIoctl(UI_SET_KEYBIT, key);
         for (unsigned axis : {REL_X, REL_Y})
             checkedIoctl(UI_SET_RELBIT, axis);
@@ -438,7 +576,7 @@ public:
         setup.id.vendor = 0x2717;
         setup.id.product = 0x4d80;
         setup.id.version = 1;
-        std::strncpy(setup.name, "Xiaomi Focus Pen Air Pointer Buttons",
+        std::strncpy(setup.name, "Xiaomi Focus Pen Actions Mouse",
                      sizeof(setup.name) - 1);
         if (ioctl(fd_, UI_DEV_SETUP, &setup) < 0)
             throw std::runtime_error("UI_DEV_SETUP failed");
@@ -447,7 +585,7 @@ public:
         usleep(100000);
     }
 
-    ~UInputAirPointerButtons() {
+    ~UInputActionMouse() {
         if (fd_ < 0)
             return;
         try {
@@ -458,33 +596,216 @@ public:
         close(fd_);
     }
 
-    void report(const PenButtons &buttons) {
+    void report(const MouseButtons &buttons) {
         if (buttons == buttons_)
             return;
         buttons_ = buttons;
-        std::array<input_event, 3> events{};
-        events[0].type = EV_KEY;
-        events[0].code = BTN_LEFT;
-        events[0].value = buttons_.button1;
-        events[1].type = EV_KEY;
-        events[1].code = BTN_RIGHT;
-        events[1].value = buttons_.button2;
-        events[2].type = EV_SYN;
-        events[2].code = SYN_REPORT;
+        std::array<input_event, 6> events{};
+        const std::array<std::pair<unsigned, bool>, 5> values{{
+            {BTN_LEFT, buttons_.left},
+            {BTN_RIGHT, buttons_.right},
+            {BTN_MIDDLE, buttons_.middle},
+            {BTN_SIDE, buttons_.back},
+            {BTN_EXTRA, buttons_.forward},
+        }};
+        for (size_t index = 0; index < values.size(); ++index) {
+            events[index].type = EV_KEY;
+            events[index].code = values[index].first;
+            events[index].value = values[index].second;
+        }
+        events.back().type = EV_SYN;
+        events.back().code = SYN_REPORT;
         writeInputEvents(fd_, events.data(), events.size());
-        std::cerr << "Focus Pen air-pointer buttons: left="
-                  << buttons_.button1 << " right=" << buttons_.button2
-                  << '\n';
+        std::cerr << "Focus Pen action mouse: left=" << buttons_.left
+                  << " right=" << buttons_.right
+                  << " middle=" << buttons_.middle
+                  << " back=" << buttons_.back
+                  << " forward=" << buttons_.forward << '\n';
     }
 
 private:
     int fd_ = -1;
-    PenButtons buttons_{};
+    MouseButtons buttons_{};
 
     void checkedIoctl(unsigned long request, unsigned long value) {
         if (ioctl(fd_, request, value) < 0)
             throw std::runtime_error("uinput capability ioctl failed");
     }
+};
+
+class UInputActionKeyboard {
+public:
+    UInputActionKeyboard() {
+        fd_ = open("/dev/uinput", O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+        if (fd_ < 0)
+            throw std::runtime_error(std::string("open /dev/uinput: ") +
+                                     std::strerror(errno));
+        checkedIoctl(UI_SET_EVBIT, EV_KEY);
+        for (unsigned key : kKeys)
+            checkedIoctl(UI_SET_KEYBIT, key);
+
+        uinput_setup setup{};
+        setup.id.bustype = BUS_VIRTUAL;
+        setup.id.vendor = 0x2717;
+        setup.id.product = 0x4d81;
+        setup.id.version = 1;
+        std::strncpy(setup.name, "Xiaomi Focus Pen Actions Keyboard",
+                     sizeof(setup.name) - 1);
+        if (ioctl(fd_, UI_DEV_SETUP, &setup) < 0)
+            throw std::runtime_error("UI_DEV_SETUP failed");
+        if (ioctl(fd_, UI_DEV_CREATE) < 0)
+            throw std::runtime_error("UI_DEV_CREATE failed");
+        usleep(100000);
+    }
+
+    ~UInputActionKeyboard() {
+        if (fd_ < 0)
+            return;
+        try {
+            report({});
+        } catch (...) {
+        }
+        ioctl(fd_, UI_DEV_DESTROY);
+        close(fd_);
+    }
+
+    void report(const ShortcutKeys &keys) {
+        if (keys == keys_)
+            return;
+        std::array<input_event, kKeys.size() + 1> events{};
+        size_t count = 0;
+        auto append = [&](unsigned code, int value) {
+            input_event &event = events[count++];
+            event.type = EV_KEY;
+            event.code = code;
+            event.value = value;
+        };
+        for (unsigned key : kKeys) {
+            if (!keys_[key] && keys[key])
+                append(key, 1);
+        }
+        for (auto iterator = kKeys.rbegin(); iterator != kKeys.rend();
+             ++iterator) {
+            if (keys_[*iterator] && !keys[*iterator])
+                append(*iterator, 0);
+        }
+        events[count].type = EV_SYN;
+        events[count].code = SYN_REPORT;
+        ++count;
+        writeInputEvents(fd_, events.data(), count);
+        keys_ = keys;
+    }
+
+private:
+    static constexpr std::array<unsigned, 5> kKeys{
+        KEY_LEFTCTRL,
+        KEY_LEFTSHIFT,
+        KEY_LEFTMETA,
+        KEY_Z,
+        KEY_SYSRQ,
+    };
+    int fd_ = -1;
+    ShortcutKeys keys_{};
+
+    void checkedIoctl(unsigned long request, unsigned long value) {
+        if (ioctl(fd_, request, value) < 0)
+            throw std::runtime_error("uinput capability ioctl failed");
+    }
+};
+
+class ButtonMappingControl {
+public:
+    ButtonMappingControl() {
+        fd_ = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        if (fd_ < 0)
+            throw std::runtime_error(std::string("button mapping socket: ") +
+                                     std::strerror(errno));
+        sockaddr_un address{};
+        address.sun_family = AF_UNIX;
+        if (std::strlen(kButtonMappingSocket) >= sizeof(address.sun_path))
+            throw std::runtime_error("button mapping socket path is too long");
+        std::strncpy(address.sun_path, kButtonMappingSocket,
+                     sizeof(address.sun_path) - 1);
+        unlink(kButtonMappingSocket);
+        if (bind(fd_, reinterpret_cast<sockaddr *>(&address),
+                 sizeof(address)) < 0) {
+            const int saved_errno = errno;
+            close(fd_);
+            fd_ = -1;
+            throw std::runtime_error(std::string("bind button mapping socket: ") +
+                                     std::strerror(saved_errno));
+        }
+        if (const group *input_group = getgrnam("input"))
+            chown(kButtonMappingSocket, 0, input_group->gr_gid);
+        if (chmod(kButtonMappingSocket, 0660) < 0)
+            std::cerr << "button mapping socket chmod failed: "
+                      << std::strerror(errno) << '\n';
+        std::cerr << "Focus Pen button mapping control ready ("
+                  << kButtonMappingSocket << ")\n";
+    }
+
+    ~ButtonMappingControl() {
+        if (fd_ >= 0)
+            close(fd_);
+        unlink(kButtonMappingSocket);
+    }
+
+    int fd() const {
+        return fd_;
+    }
+
+    bool drain(ButtonMapping &mapping) {
+        bool changed = false;
+        while (true) {
+            std::array<char, 256> buffer{};
+            const ssize_t size = recv(fd_, buffer.data(), buffer.size(), 0);
+            if (size < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+                return changed;
+            if (size <= 0)
+                return changed;
+
+            std::istringstream input(
+                std::string(buffer.data(), static_cast<size_t>(size)));
+            std::string command;
+            std::array<std::string, 4> names;
+            std::string trailing;
+            if (!(input >> command >> names[0] >> names[1] >> names[2] >>
+                  names[3]) || command != "map" || (input >> trailing)) {
+                std::cerr << "ignored invalid Focus Pen button mapping\n";
+                continue;
+            }
+            std::array<ButtonAction, 4> actions{};
+            bool valid = true;
+            for (size_t index = 0; index < names.size(); ++index) {
+                const auto action = parseButtonAction(names[index]);
+                if (!action) {
+                    valid = false;
+                    break;
+                }
+                actions[index] = *action;
+            }
+            if (!valid) {
+                std::cerr << "ignored unknown Focus Pen button action\n";
+                continue;
+            }
+            const ButtonMapping next{
+                {actions[0], actions[1]},
+                {actions[2], actions[3]},
+            };
+            if (next == mapping)
+                continue;
+            mapping = next;
+            changed = true;
+            std::cerr << "Focus Pen button mapping: pen="
+                      << buttonActionName(mapping.pen.primary) << ','
+                      << buttonActionName(mapping.pen.secondary)
+                      << " air=" << buttonActionName(mapping.air.primary)
+                      << ',' << buttonActionName(mapping.air.secondary) << '\n';
+        }
+    }
+
+private:
+    int fd_ = -1;
 };
 
 struct ProGestureButtons {
@@ -1438,7 +1759,8 @@ int main() try {
     std::optional<UInputTouch> touch;
     std::optional<UInputPen> pen_m80p;
     std::optional<UInputPen> pen_p81c;
-    std::optional<UInputAirPointerButtons> air_pointer_buttons;
+    std::optional<UInputActionMouse> action_mouse;
+    std::optional<UInputActionKeyboard> action_keyboard;
     std::optional<UInputProGestures> pro_gestures;
     try {
         nvt::StylusModel stylus_model = nvt::StylusModel::M80p;
@@ -1449,7 +1771,8 @@ int main() try {
         touch.emplace();
         pen_m80p.emplace(nvt::StylusModel::M80p);
         pen_p81c.emplace(nvt::StylusModel::P81c);
-        air_pointer_buttons.emplace();
+        action_mouse.emplace();
+        action_keyboard.emplace();
         std::cerr << "touch and pen pipelines ready\n";
         std::cerr << "waiting for a touch reference frame\n";
         LiveTouchAdapter adapter;
@@ -1462,6 +1785,8 @@ int main() try {
         DisplayStateReader display_state;
         nvt::P81cAgController p81c_ag_controller;
         FocusPenHidReader pen_transport;
+        ButtonMappingControl button_mapping_control;
+        ButtonMapping button_mapping;
         bool touch_active = false;
         bool pen_active = false;
         PenButtons m80p_buttons{};
@@ -1480,14 +1805,26 @@ int main() try {
             if (UInputPen *pen = activePen())
                 pen->report({});
         };
-        auto updateAirPointerButtons = [&]() {
-            if (!air_pointer_buttons)
-                return;
-            const bool enabled = stylus_model == nvt::StylusModel::M80p &&
-                                 pen_transport.airPointerActive() &&
-                                 !pen_active;
-            air_pointer_buttons->report(enabled ? m80p_buttons
-                                                : PenButtons{});
+        auto updateButtonActions = [&]() {
+            PenButtons native_buttons{};
+            MouseButtons mouse_buttons{};
+            ShortcutKeys shortcut_keys{};
+            if (stylus_model == nvt::StylusModel::M80p) {
+                const bool air_mode = pen_transport.airPointerActive() &&
+                                      !pen_active;
+                const ButtonContextMapping &context = air_mode
+                    ? button_mapping.air : button_mapping.pen;
+                addButtonAction(context.primary, m80p_buttons.button1, true,
+                                native_buttons, mouse_buttons, shortcut_keys);
+                addButtonAction(context.secondary, m80p_buttons.button2, false,
+                                native_buttons, mouse_buttons, shortcut_keys);
+            }
+            if (UInputPen *pen = activePen())
+                pen->reportButtons(native_buttons);
+            if (action_mouse)
+                action_mouse->report(mouse_buttons);
+            if (action_keyboard)
+                action_keyboard->report(shortcut_keys);
         };
         auto resetPipelines = [&]() {
             if (touch)
@@ -1501,7 +1838,7 @@ int main() try {
                 pencil_posture.reset();
             touch_active = false;
             pen_active = false;
-            updateAirPointerButtons();
+            updateButtonActions();
             have_valid_frame = false;
             stream_stalled = false;
         };
@@ -1510,7 +1847,7 @@ int main() try {
                 return;
             releaseActivePen();
             m80p_buttons = {};
-            updateAirPointerButtons();
+            updateButtonActions();
             if (stylus_model == nvt::StylusModel::P81c) {
                 p81c_ag_controller.disable();
                 pro_gestures.reset();
@@ -1560,7 +1897,7 @@ int main() try {
                         pen->report({});
                 }
                 pen_active = false;
-                updateAirPointerButtons();
+                updateButtonActions();
             }
             if (update.model)
                 switchStylusModel(*update.model);
@@ -1571,10 +1908,8 @@ int main() try {
             }
             if (update.buttons) {
                 m80p_buttons = *update.buttons;
-                if (UInputPen *pen = activePen())
-                    pen->reportButtons(*update.buttons);
             }
-            updateAirPointerButtons();
+            updateButtonActions();
             if (update.gestures && pro_gestures)
                 pro_gestures->report(*update.gestures);
             if (update.brake && stylus_model == nvt::StylusModel::P81c) {
@@ -1594,11 +1929,14 @@ int main() try {
             }
         };
         while (running) {
+            if (button_mapping_control.drain(button_mapping))
+                updateButtonActions();
             servicePenTransport();
-            std::array<pollfd, 3> descriptors{
+            std::array<pollfd, 4> descriptors{
                 pollfd{stream_fd, POLLIN, 0},
                 pollfd{pen_transport.buttonEventFd(), POLLIN, 0},
                 pollfd{pen_transport.pointerEventFd(), POLLIN, 0},
+                pollfd{button_mapping_control.fd(), POLLIN, 0},
             };
             const int status = poll(
                 descriptors.data(), descriptors.size(), 100);
@@ -1611,6 +1949,9 @@ int main() try {
             if (status > 0) {
                 servicePenTransport();
             }
+            if (status > 0 && (descriptors[3].revents & POLLIN) &&
+                button_mapping_control.drain(button_mapping))
+                updateButtonActions();
             if (status > 0 &&
                 (descriptors[0].revents & (POLLIN | POLLERR | POLLHUP))) {
                 reader.readAvailable([&](uint64_t timestamp,
@@ -1671,7 +2012,7 @@ int main() try {
                                 pen->report(state);
                         }
                         pen_active = result.active;
-                        updateAirPointerButtons();
+                        updateButtonActions();
                         stylus_mutual.ingest(raw_stylus);
                         if (stylus_mutual.hasMatrix()) {
                             const uint8_t frame_type =

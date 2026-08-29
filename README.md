@@ -9,8 +9,9 @@ Finger input, multi-touch tracking, palm rejection, pen coordinates, tilt,
 hover, Bluetooth HID pressure, and both barrel buttons are supported. While the
 Focus Pen air pointer is moving, its two barrel buttons also act as left and
 right mouse clicks; approaching the screen returns them to normal stylus
-buttons. Please note that pen scanning is only available when the panel is
-running at 60 Hz or 120 Hz.
+buttons. Both contexts can be remapped at runtime through the control socket.
+Please note that pen scanning is only available when the panel is running at
+60 Hz or 120 Hz.
 
 ## Requirements
 
@@ -29,12 +30,27 @@ running at 60 Hz or 120 Hz.
 - A C++20 compiler, GNU Make, pkg-config, GLib development files, and libssc
   development files when building from source
 
-[xiaomi-pen-status](https://github.com/ianchb/xiaomi-pen-status) is recommended for pen detection, Bluetooth connection
-assistance, and refresh-rate notifications. It is optional and is not required
-for the touch service to start.
+[xiaomi-pen-status](https://github.com/DotRedstone/xiaomi-pen-status) is
+recommended for pen detection, Bluetooth connection assistance, refresh-rate
+notifications, and button mapping. It is optional and is not required for the
+touch service to start.
 
 The service runs as root because it controls the THP stream, reads the pen HID
 transport, and creates uinput devices.
+
+## Button Mapping
+
+The service listens on `/run/xiaomi-sheng-thp/button-mapping.sock`. Members of
+the `input` group can send one datagram containing:
+
+```text
+map PEN_PRIMARY PEN_SECONDARY AIR_PRIMARY AIR_SECONDARY
+```
+
+Each action is one of `native`, `left`, `right`, `middle`, `back`, `forward`,
+`undo`, `redo`, `screenshot`, `overview`, or `disabled`. Defaults are
+`map native native left right`. The status application stores the selection per
+user and reapplies it when the graphical session starts.
 
 ## Build
 
